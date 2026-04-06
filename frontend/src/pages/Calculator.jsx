@@ -14,7 +14,7 @@ const RES=[
 ]
 
 export default function Calculator(){
-  const{locResults,expiryCache,marketData}=useStore()
+  const{locResults,expiryCache,marketData,spotKeys}=useStore()
   const[sym,setSym]=useState("NIFTY")
   const[expiry,setExpiry]=useState("")
 
@@ -22,8 +22,8 @@ export default function Calculator(){
   const loc=locResults[sym]||{}
   const exInfo=expiryCache[sym]||{}
 
-  // Spot data from market data
-  const spotKey=SYM_TO_KEY[sym]||""
+  // Spot data from market data — use dynamic spotKeys (has MCX), fallback to static SYM_TO_KEY
+  const spotKey=spotKeys[sym]||SYM_TO_KEY[sym]||""
   const spotD=marketData[spotKey]||{}
   const ltpc=spotD.ltpc||{}; const ef=spotD.efeed||{}
   const ltp=ltpc.ltp||ef.ltp||loc.ltp||0

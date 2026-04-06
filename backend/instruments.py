@@ -22,7 +22,7 @@ STRIKE_STEPS = {
     "SENSEX":100,"BANKEX":100,"CRUDEOIL":50,"NATURALGAS":10,
     "GOLD":100,"SILVER":1000,"COPPER":5,
 }
-MONTHLY_SYMBOLS = {"GOLD","SILVER","COPPER"}
+MONTHLY_SYMBOLS = {"GOLD","SILVER","COPPER","CRUDEOIL","NATURALGAS"}
 
 _M = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
 
@@ -89,9 +89,53 @@ async def fetch_expiry_list(symbol: str, token: str) -> list:
         from .instrument_keys import NSE_EQ_KEYS
         spot_key = NSE_EQ_KEYS.get(symbol.upper(), "")
     if not spot_key: return calculate_expiries_fallback(symbol)
-    # For MCX, use option underlying key if available
+
+    # For MCX, each futures key only returns its own month's option expiries.
+    # Query multiple futures keys to collect all available expiries.
     if spot_key.startswith("MCX"):
-        spot_key = _mcx_option_underlying.get(symbol.upper(), spot_key)
+        all_expiries = set()
+        keys_to_try = []
+        # Collect all futures keys for this symbol from instrument master
+        sym_upper = symbol.upper()
+        for tsym, ikey in _mcx_sym_to_key.items():
+            if tsym.startswith(sym_upper) and tsym.endswith("FUT"):
+                suffix = tsym[len(sym_upper):]
+                if suffix[0:1] == "M" and suffix[1:2].isdigit():
+                    continue  # skip mini
+                if any(v in tsym for v in ["PETAL", "GUINEA", "TEN", "MIC"]):
+                    continue
+                keys_to_try.append((tsym, ikey))
+        # Also include the option underlying key if set
+        opt_key = _mcx_option_underlying.get(sym_upper)
+        if opt_key and opt_key not in [k for _, k in keys_to_try]:
+            keys_to_try.append(("OPT_UNDERLYING", opt_key))
+        # Fallback to spot key
+        if not keys_to_try:
+            keys_to_try.append(("SPOT", spot_key))
+
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                for tsym, ikey in keys_to_try[:4]:  # limit to 4 nearest futures
+                    r = await c.get(UPSTOX_CONTRACTS,
+                                    params={"instrument_key": ikey},
+                                    headers=_h(token))
+                    if r.status_code == 200:
+                        contracts = r.json().get("data", [])
+                        if isinstance(contracts, list):
+                            for x in contracts:
+                                if isinstance(x, dict) and x.get("expiry"):
+                                    all_expiries.add(x["expiry"])
+                    await asyncio.sleep(0.15)
+        except Exception as e:
+            print(f"[Expiry] {symbol}: {e}")
+
+        if all_expiries:
+            expiries = sorted(all_expiries)
+            print(f"[Expiry] {symbol}: {expiries[:6]} ({len(expiries)} total)")
+            return expiries
+        return calculate_expiries_fallback(symbol)
+
+    # Non-MCX: single query
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(UPSTOX_CONTRACTS, params={"instrument_key": spot_key}, headers=_h(token))
