@@ -28,6 +28,7 @@ export default function ChartModal({instrKey:rawKey,onClose}){
   const[err,setErr]=useState("")
   const chartRef=useRef(null); const ctRef=useRef(null)
   const seriesRef=useRef(null)
+  const liveCandleRef=useRef(null) // tracks current candle {time,open,high,low,close}
 
   const meta=getMeta(instrKey,marketData[instrKey])
   const sym=meta.s||rawKey
@@ -81,6 +82,7 @@ export default function ChartModal({instrKey:rawKey,onClose}){
         }
       }
       setCandles(data)
+      liveCandleRef.current=null // reset live candle tracking on fresh load
       if(data.length===0) setErr("No candle data available for this period")
     }catch(e){
       setErr("Failed to load: "+e.message)
@@ -93,7 +95,7 @@ export default function ChartModal({instrKey:rawKey,onClose}){
   // ── Build chart ──────────────────────────────────────────────
   useEffect(()=>{
     if(!chartRef.current) return
-    ctRef.current?.remove(); ctRef.current=null; seriesRef.current=null
+    ctRef.current?.remove(); ctRef.current=null; seriesRef.current=null; liveCandleRef.current=null
 
     const chart=createChart(chartRef.current,{
       layout:{background:{color:"#0b1018"},textColor:"#4a5568"},
@@ -149,13 +151,37 @@ export default function ChartModal({instrKey:rawKey,onClose}){
   // ── Real-time update: push latest tick to chart ───────────────
   useEffect(()=>{
     if(!seriesRef.current||!ltp||candles.length===0) return
+    if(tf.unit==="days") return // don't live-update daily candles
+
+    const bucketSize=tf.interval*(tf.unit==="hours"?3600:60)
     const nowSec=Math.floor(Date.now()/1000)
-    const minuteSec=Math.floor(nowSec/(tf.interval*(tf.unit==="hours"?3600:60)))*
-      (tf.interval*(tf.unit==="hours"?3600:60))
-    try{
-      seriesRef.current.update({time:minuteSec,open:open_||ltp,high:Math.max(high,ltp),
-        low:Math.min(low>0?low:ltp,ltp),close:ltp})
-    }catch(e){}
+    const calcTime=Math.floor(nowSec/bucketSize)*bucketSize
+
+    // Find last loaded candle time (API timestamps) to avoid going backwards
+    const lastLoaded=candles[candles.length-1]
+    const lastLoadedSec=lastLoaded?Math.floor((lastLoaded.t||0)/1000):0
+    const lastLoadedBucket=lastLoadedSec?Math.floor(lastLoadedSec/bucketSize)*bucketSize:0
+
+    // Use max of client time vs last loaded time — prevents silent update() failure
+    const candleTime=Math.max(calcTime,lastLoadedBucket)
+
+    const prev=liveCandleRef.current
+    let candle
+    if(prev&&prev.time===candleTime){
+      // Same candle period — update high/low/close, keep open
+      candle={time:candleTime,open:prev.open,
+        high:Math.max(prev.high,ltp),low:Math.min(prev.low,ltp),close:ltp}
+    } else if(!prev&&lastLoaded&&lastLoadedBucket===candleTime){
+      // First tick after load, same bucket as last API candle — merge with its OHLC
+      candle={time:candleTime,open:lastLoaded.o||ltp,
+        high:Math.max(lastLoaded.h||ltp,ltp),
+        low:Math.min((lastLoaded.l&&lastLoaded.l>0?lastLoaded.l:ltp),ltp),close:ltp}
+    } else {
+      // New candle period
+      candle={time:candleTime,open:ltp,high:ltp,low:ltp,close:ltp}
+    }
+    liveCandleRef.current=candle
+    try{ seriesRef.current.update(candle) }catch(e){}
   },[ltp,tf])
 
   const zoneColor=loc?.zone==="CALL"?"#00e676":loc?.zone==="PUT"?"#ff3d5a":"#ffc94d"

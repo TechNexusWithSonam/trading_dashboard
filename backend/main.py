@@ -330,6 +330,9 @@ class AppState:
     decode_ok:   int = 0
     subscribed_option_keys: set = set()
     feed_log: list = []  # recent feed debug messages
+    _feed_buffer: dict = {}       # buffered feeds for throttled broadcast
+    _feed_buffer_lock = None      # asyncio.Lock, created at startup
+    _flush_task = None
 
 state = AppState()
 
@@ -347,14 +350,8 @@ loc_engine = LOCEngine()
 
 async def _on_loc(symbol: str, result: dict):
     _record_loc_hist(symbol, result)
-    # Include spot_key so frontend can link index card to LOC
-    spot_key = SPOT_KEYS_D.get(symbol, "")
-    await broadcast({
-        "type": "loc_update",
-        "symbol": symbol,
-        "spot_key": spot_key,
-        "loc": result,
-    })
+    # LOC results are sent via throttled live_feed flush (loc_results field)
+    # No need to broadcast individually — avoids per-tick flickering
 
 loc_engine.on_loc_update = _on_loc
 for sym in LOC_SYMBOLS:
@@ -429,13 +426,15 @@ async def startup_init():
     # Step 3: Refresh NSE_EQ keys from instrument master (fixes stale ISINs)
     refresh_nse_eq_keys()
 
-    # Step 4: Build reverse map
+    # Step 4: Build reverse map — only PRIMARY (current month) MCX key per symbol
     FEED_KEY_TO_SYM.clear()
     for sym, key in SPOT_KEYS_D.items():
         FEED_KEY_TO_SYM[key] = sym
+    # Only map current month (m=0) MCX keys to LOC symbol — NOT next/far month
+    # This prevents next-month prices (e.g. CRUDEOIL May=9118) from overwriting
+    # current-month prices (e.g. CRUDEOIL Apr=10000) in the LOC engine
     for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER","COPPER"]:
-        for m in [0,1,2]:
-            FEED_KEY_TO_SYM[mcx_key(s,m)] = s
+        FEED_KEY_TO_SYM[valid_mcx.get(s, mcx_key(s,0))] = s
     # Also map updated NSE_EQ keys
     for sym, key in _ik.NSE_EQ_KEYS.items():
         FEED_KEY_TO_SYM[key] = sym
@@ -688,7 +687,10 @@ async def broadcast(msg: dict):
                         merged_ef.get("open",ltp),
                         merged_ef.get("high",ltp),
                         merged_ef.get("low",ltp), ts)
-        msg["loc_results"] = loc_engine.get_all_results()
+        # Buffer feeds for throttled broadcast to frontend
+        for k, fv in feeds.items():
+            state._feed_buffer[k] = fv
+        return  # don't send immediately — _flush_feed_buffer will do it
 
     elif msg.get("type") == "market_info":
         si = msg.get("marketInfo",{}).get("segmentStatus",{})
@@ -699,12 +701,38 @@ async def broadcast(msg: dict):
             if not state.market_data.get(k,{}).get("ltpc",{}).get("ltp"):
                 state.market_data[k] = v
 
+    # Non-live messages (snapshot_update, market_info, etc.) send immediately
+    await _send_to_clients(msg)
+
+
+async def _send_to_clients(msg: dict):
+    """Send a message to all connected browser WebSocket clients."""
     if not state.connected_clients: return
     text = json.dumps(msg); dead = set()
     for ws in list(state.connected_clients):
         try: await ws.send_text(text)
         except: dead.add(ws)
     state.connected_clients -= dead
+
+
+FEED_THROTTLE_MS = 300  # send at most ~3 updates/sec to frontend
+
+async def _flush_feed_buffer():
+    """Background task: flush buffered feed ticks to frontend at throttled rate."""
+    while True:
+        await asyncio.sleep(FEED_THROTTLE_MS / 1000)
+        if not state._feed_buffer or not state.connected_clients:
+            continue
+        # Swap buffer atomically
+        feeds = state._feed_buffer
+        state._feed_buffer = {}
+        msg = {
+            "type": "live_feed",
+            "feeds": feeds,
+            "currentTs": str(int(time.time() * 1000)),
+            "loc_results": loc_engine.get_all_results(),
+        }
+        await _send_to_clients(msg)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1076,8 +1104,9 @@ async def on_startup():
     global SPOT_KEYS_D, FEED_KEY_TO_SYM
     SPOT_KEYS_D = get_spot_keys()
     FEED_KEY_TO_SYM = {v:k for k,v in SPOT_KEYS_D.items()}
+    # Only map current month (m=0) MCX keys — prevents next-month price mixing
     for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER","COPPER"]:
-        for m in [0,1,2]: FEED_KEY_TO_SYM[mcx_key(s,m)] = s
+        FEED_KEY_TO_SYM[mcx_key(s,0)] = s
 
     if USE_MOCK:
         from backend.mock_feed import start_mock_feed
@@ -1087,6 +1116,9 @@ async def on_startup():
         state.feed_task = asyncio.create_task(start_feed())
     else:
         print("[!] No token — POST /auth/token or set UPSTOX_ACCESS_TOKEN in .env")
+
+    # Start throttled feed flush task
+    state._flush_task = asyncio.create_task(_flush_feed_buffer())
 
     asyncio.create_task(_delayed_startup())
 
