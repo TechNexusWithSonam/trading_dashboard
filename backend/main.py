@@ -660,10 +660,12 @@ async def broadcast(msg: dict):
         msg["feeds"] = feeds
         for k, fv in feeds.items():
             ltp, cp, o, h, l = _ex(fv)
-            # Restore prev_close if feed omits it
-            if cp == 0 and k in state.prev_close:
+            # Always prefer REST-derived prev_close (from net_change) as the
+            # authoritative source.  WS ltpc.cp for MCX instruments often
+            # equals the current LTP instead of the actual previous close.
+            if k in state.prev_close:
                 cp = state.prev_close[k]
-                fv.setdefault("ltpc",{})["cp"] = cp
+            fv.setdefault("ltpc",{})["cp"] = cp
             # Merge efeed: preserve day open/high/low from REST snapshot
             existing = state.market_data.get(k, {})
             prev_ef = existing.get("efeed", {})

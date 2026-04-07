@@ -260,6 +260,8 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                 await asyncio.sleep(0.2)
 
             # Step 6: Build chain dict
+            # Note: ohlc.close = today's close (= LTP during trading), NOT previous day's close.
+            # Derive previous close from net_change: prev_close = ltp - net_change.
             chain = {}
             for strike in nearby_strikes:
                 ce_key = strike_map[strike].get("CE", "")
@@ -269,10 +271,18 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                 ce_ohlc = ce_q.get("ohlc", {}) or {}
                 pe_ohlc = pe_q.get("ohlc", {}) or {}
 
+                ce_ltp = float(ce_q.get("last_price", 0) or 0)
+                ce_net = float(ce_q.get("net_change", 0) or 0)
+                ce_prev_close = round(ce_ltp - ce_net, 2) if ce_ltp and ce_net else 0
+
+                pe_ltp = float(pe_q.get("last_price", 0) or 0)
+                pe_net = float(pe_q.get("net_change", 0) or 0)
+                pe_prev_close = round(pe_ltp - pe_net, 2) if pe_ltp and pe_net else 0
+
                 chain[strike] = {
                     "CE": {
-                        "ltp":   float(ce_q.get("last_price", 0) or 0),
-                        "close": float(ce_ohlc.get("close", 0) or 0),
+                        "ltp":   ce_ltp,
+                        "close": ce_prev_close,
                         "high":  float(ce_ohlc.get("high", 0) or 0),
                         "low":   float(ce_ohlc.get("low", 0) or 0),
                         "oi":    float(ce_q.get("oi", 0) or 0),
@@ -280,8 +290,8 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                         "key":   ce_key,
                     },
                     "PE": {
-                        "ltp":   float(pe_q.get("last_price", 0) or 0),
-                        "close": float(pe_ohlc.get("close", 0) or 0),
+                        "ltp":   pe_ltp,
+                        "close": pe_prev_close,
                         "high":  float(pe_ohlc.get("high", 0) or 0),
                         "low":   float(pe_ohlc.get("low", 0) or 0),
                         "oi":    float(pe_q.get("oi", 0) or 0),
