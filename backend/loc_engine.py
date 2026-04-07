@@ -173,13 +173,19 @@ class LOCEngine:
 
     def update_option_from_feed(self, symbol:str, opt_type:str,
                                  ltp:float, close:float, high:float, low:float):
-        """Real-time CE/PE price update from WS feed."""
+        """Real-time CE/PE price update from WS feed.
+        Note: close (cp from WS ltpc) is the previous day's close and should
+        only be set once. We do NOT overwrite it on every tick because for
+        options, once set from REST (which derives it from net_change), the
+        REST value is authoritative. WS cp can be used as initial seed only.
+        """
         st=self.symbols.get(symbol)
         if not st: return
         opt = st.ce if opt_type=="CE" else st.pe
         if ltp and ltp>0:
             opt.ltp = ltp
-        if close and close>0:
+        # Only seed close from WS if we have no close yet (REST hasn't arrived)
+        if close and close>0 and not opt.close:
             opt.close = close
         if high and high>0:
             opt.high = max(opt.high, high) if opt.high else high
