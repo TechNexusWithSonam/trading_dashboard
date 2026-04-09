@@ -272,23 +272,31 @@ class LOCEngine:
             c = ce_row["CE"]
             new_ce_key = c.get("key", "")
             key_changed = (new_ce_key and new_ce_key != st.ce.instrument_key)
-            ltp   = _best(c.get("ltp"), c.get("close"))
-            close = _best(c.get("close"), c.get("ltp"))
-            st.ce.ltp   = ltp
-            st.ce.close = close
+            chain_ltp   = _best(c.get("ltp"), c.get("close"))
+            chain_close = _best(c.get("close"), c.get("ltp"))
+            # Only overwrite LTP from chain if instrument changed (ATM shift)
+            # or we have no WS data yet. WS LTP is real-time and authoritative.
+            if key_changed or not st.ce.ltp:
+                st.ce.ltp = chain_ltp
+            # Close: update from chain (chain close_price is prev day's close for NSE,
+            # net_change-derived for MCX). Only overwrite if chain has a value.
+            if chain_close and (key_changed or not st.ce.close):
+                st.ce.close = chain_close
             # Only overwrite high/low from chain if chain has actual values.
             # If chain returns 0/None, preserve existing values from OHLC REST.
             # Reset to ltp only when the option instrument changed (ATM shift).
             chain_high = _best(c.get("high"))
             chain_low  = _best(c.get("low"))
             if chain_high:
-                st.ce.high = chain_high
+                if key_changed: st.ce.high = chain_high
+                else: st.ce.high = max(st.ce.high, chain_high) if st.ce.high else chain_high
             elif key_changed or not st.ce.high:
-                st.ce.high = ltp
+                st.ce.high = chain_ltp
             if chain_low:
-                st.ce.low = chain_low
+                if key_changed: st.ce.low = chain_low
+                else: st.ce.low = min(st.ce.low, chain_low) if st.ce.low else chain_low
             elif key_changed or not st.ce.low:
-                st.ce.low = ltp
+                st.ce.low = chain_ltp
             st.ce.oi    = float(c.get("oi") or 0)
             st.ce.iv    = float(c.get("iv") or 0)
             st.ce.instrument_key = new_ce_key or st.ce.instrument_key
@@ -297,20 +305,24 @@ class LOCEngine:
             p = pe_row["PE"]
             new_pe_key = p.get("key", "")
             key_changed = (new_pe_key and new_pe_key != st.pe.instrument_key)
-            ltp   = _best(p.get("ltp"), p.get("close"))
-            close = _best(p.get("close"), p.get("ltp"))
-            st.pe.ltp   = ltp
-            st.pe.close = close
+            chain_ltp   = _best(p.get("ltp"), p.get("close"))
+            chain_close = _best(p.get("close"), p.get("ltp"))
+            if key_changed or not st.pe.ltp:
+                st.pe.ltp = chain_ltp
+            if chain_close and (key_changed or not st.pe.close):
+                st.pe.close = chain_close
             chain_high = _best(p.get("high"))
             chain_low  = _best(p.get("low"))
             if chain_high:
-                st.pe.high = chain_high
+                if key_changed: st.pe.high = chain_high
+                else: st.pe.high = max(st.pe.high, chain_high) if st.pe.high else chain_high
             elif key_changed or not st.pe.high:
-                st.pe.high = ltp
+                st.pe.high = chain_ltp
             if chain_low:
-                st.pe.low = chain_low
+                if key_changed: st.pe.low = chain_low
+                else: st.pe.low = min(st.pe.low, chain_low) if st.pe.low else chain_low
             elif key_changed or not st.pe.low:
-                st.pe.low = ltp
+                st.pe.low = chain_ltp
             st.pe.oi    = float(p.get("oi") or 0)
             st.pe.iv    = float(p.get("iv") or 0)
             st.pe.instrument_key = new_pe_key or st.pe.instrument_key

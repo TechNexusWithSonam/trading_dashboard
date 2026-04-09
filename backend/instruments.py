@@ -239,25 +239,33 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
             quotes = {}
             for i in range(0, len(quote_keys), 25):
                 chunk = quote_keys[i:i+25]
-                r3 = await c.get(UPSTOX_QUOTE_V2,
-                                 params={"instrument_key": ",".join(chunk)},
-                                 headers=_h(token))
-                if r3.status_code == 200:
-                    resp_data = (r3.json().get("data", {}) or {})
-                    # Map response name-based keys to numeric keys
-                    for rk, rv in resp_data.items():
-                        if rv:
-                            # Store by response key
-                            quotes[rk.replace(":", "|", 1)] = rv
-                    # Map requested numeric keys → name-based response keys
-                    for req_key in chunk:
-                        name_key = _mcx_numeric_to_name.get(req_key, "")
-                        if name_key:
-                            colon_name = name_key.replace("|", ":", 1)
-                            val = resp_data.get(colon_name)
-                            if val:
-                                quotes[req_key] = val
-                await asyncio.sleep(0.2)
+                # Retry once on rate limit (429)
+                for attempt in range(2):
+                    r3 = await c.get(UPSTOX_QUOTE_V2,
+                                     params={"instrument_key": ",".join(chunk)},
+                                     headers=_h(token))
+                    if r3.status_code == 200:
+                        resp_data = (r3.json().get("data", {}) or {})
+                        # Map response name-based keys to numeric keys
+                        for rk, rv in resp_data.items():
+                            if rv:
+                                quotes[rk.replace(":", "|", 1)] = rv
+                        # Map requested numeric keys -> name-based response keys
+                        for req_key in chunk:
+                            name_key = _mcx_numeric_to_name.get(req_key, "")
+                            if name_key:
+                                colon_name = name_key.replace("|", ":", 1)
+                                val = resp_data.get(colon_name)
+                                if val:
+                                    quotes[req_key] = val
+                        break
+                    elif r3.status_code == 429 and attempt == 0:
+                        print(f"[MCXChain] Rate limited on chunk {i//25+1}, retrying in 1.5s...")
+                        await asyncio.sleep(1.5)
+                    else:
+                        print(f"[MCXChain] Quote chunk {i//25+1} HTTP {r3.status_code}")
+                        break
+                await asyncio.sleep(0.3)
 
             # Step 6: Build chain dict
             # Note: ohlc.close = today's close (= LTP during trading), NOT previous day's close.
@@ -506,31 +514,48 @@ async def fetch_option_ohlc_rest(ce_key: str, pe_key: str, token: str) -> dict:
     result = {}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(UPSTOX_QUOTE_V2,
-                            params={"instrument_key": ",".join(keys)},
-                            headers=_h(token))
-            if r.status_code == 200:
-                data = (r.json() or {}).get("data") or {}
-                # API returns keys in trading-symbol format (e.g. NSE_FO:NIFTY2640722600CE)
-                # which differs from numeric instrument_key (NSE_FO|40738).
-                # Match by iterating response and detecting CE/PE from key suffix.
-                for resp_key, val in data.items():
-                    if not val: continue
-                    # Try direct key match first
-                    matched_key = None
-                    pipe_key = resp_key.replace(":", "|", 1)
+            # Retry once on rate limit
+            for attempt in range(2):
+                r = await c.get(UPSTOX_QUOTE_V2,
+                                params={"instrument_key": ",".join(keys)},
+                                headers=_h(token))
+                if r.status_code == 200:
+                    break
+                elif r.status_code == 429 and attempt == 0:
+                    await asyncio.sleep(1.5)
+                else:
+                    print(f"[OptOHLC] HTTP {r.status_code}")
+                    return result
+            if r.status_code != 200:
+                return result
+            data = (r.json() or {}).get("data") or {}
+            # API returns keys in trading-symbol format (e.g. NSE_FO:NIFTY2640722600CE)
+            # which differs from numeric instrument_key (NSE_FO|40738).
+            # Match using: 1) direct match, 2) MCX numeric→name mapping, 3) CE/PE suffix
+            for resp_key, val in data.items():
+                if not val: continue
+                matched_key = None
+                pipe_key = resp_key.replace(":", "|", 1)
+                # Strategy 1: direct key match
+                for orig_key in keys:
+                    if orig_key == pipe_key or orig_key == resp_key:
+                        matched_key = orig_key
+                        break
+                # Strategy 2: MCX numeric→name mapping
+                if not matched_key:
                     for orig_key in keys:
-                        if orig_key == pipe_key or orig_key == resp_key:
+                        name_key = _mcx_numeric_to_name.get(orig_key, "")
+                        if name_key and name_key.replace("|", ":", 1) == resp_key:
                             matched_key = orig_key
                             break
-                    if not matched_key:
-                        # Fallback: match by CE/PE suffix
-                        if resp_key.endswith("CE") and ce_key:
-                            matched_key = ce_key
-                        elif resp_key.endswith("PE") and pe_key:
-                            matched_key = pe_key
-                    if not matched_key:
-                        continue
+                # Strategy 3: CE/PE suffix fallback
+                if not matched_key:
+                    if resp_key.endswith("CE") and ce_key:
+                        matched_key = ce_key
+                    elif resp_key.endswith("PE") and pe_key:
+                        matched_key = pe_key
+                if not matched_key:
+                    continue
                     ohlc = val.get("ohlc") or {}
                     ltp = float(val.get("last_price") or 0)
                     net_change = float(val.get("net_change") or 0)
