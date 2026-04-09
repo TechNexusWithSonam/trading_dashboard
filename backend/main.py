@@ -389,6 +389,14 @@ def _route_tick(key, ltp, cp, o, h, l, ts):
         return
     if key in option_key_map:
         sym, opt_type = option_key_map[key]
+        # Validate this key is still the active option for this symbol
+        # (prevents stale keys from overwriting new strike data after ATM shift)
+        st = loc_engine.get_state(sym)
+        if st:
+            current_key = st.ce.instrument_key if opt_type == "CE" else st.pe.instrument_key
+            if key != current_key:
+                del option_key_map[key]
+                return
         loc_engine.update_option_from_feed(sym, opt_type, ltp, cp, h, l)
 
 
@@ -550,7 +558,11 @@ async def startup_init():
 
 
 async def _refresh_option_ohlc_single(symbol: str):
-    """Fetch actual intraday OHLC for a single symbol's CE/PE via REST."""
+    """Fetch actual intraday OHLC for a single symbol's CE/PE via REST.
+    Only updates close/high/low — does NOT overwrite LTP because the
+    WebSocket feed provides real-time LTP which is more authoritative
+    than the REST snapshot (which can be seconds to minutes stale).
+    """
     if not state.access_token: return
     st = loc_engine.get_state(symbol)
     if not st or not st.ce.instrument_key: return
@@ -559,17 +571,31 @@ async def _refresh_option_ohlc_single(symbol: str):
     if not data: return
     ce_d = data.get(st.ce.instrument_key, {})
     pe_d = data.get(st.pe.instrument_key, {})
+    changed = False
     if ce_d:
-        st.ce.ltp   = ce_d["ltp"]   or ce_d["close"] or st.ce.ltp
-        st.ce.close = ce_d["close"]  or st.ce.close
-        st.ce.high  = ce_d["high"]   or st.ce.high or st.ce.ltp
-        st.ce.low   = ce_d["low"]    or st.ce.low  or st.ce.ltp
+        # Only seed LTP if WS hasn't provided one yet
+        if not st.ce.ltp and ce_d.get("ltp"):
+            st.ce.ltp = ce_d["ltp"]
+            changed = True
+        if ce_d.get("close"):
+            st.ce.close = ce_d["close"]
+        if ce_d.get("high"):
+            st.ce.high = max(st.ce.high, ce_d["high"]) if st.ce.high else ce_d["high"]
+        if ce_d.get("low"):
+            st.ce.low = min(st.ce.low, ce_d["low"]) if st.ce.low else ce_d["low"]
+        changed = True
     if pe_d:
-        st.pe.ltp   = pe_d["ltp"]   or pe_d["close"] or st.pe.ltp
-        st.pe.close = pe_d["close"]  or st.pe.close
-        st.pe.high  = pe_d["high"]   or st.pe.high or st.pe.ltp
-        st.pe.low   = pe_d["low"]    or st.pe.low  or st.pe.ltp
-    if ce_d.get("ltp") or pe_d.get("ltp"):
+        if not st.pe.ltp and pe_d.get("ltp"):
+            st.pe.ltp = pe_d["ltp"]
+            changed = True
+        if pe_d.get("close"):
+            st.pe.close = pe_d["close"]
+        if pe_d.get("high"):
+            st.pe.high = max(st.pe.high, pe_d["high"]) if st.pe.high else pe_d["high"]
+        if pe_d.get("low"):
+            st.pe.low = min(st.pe.low, pe_d["low"]) if st.pe.low else pe_d["low"]
+        changed = True
+    if changed:
         loc_engine.recalc(symbol)
 
 
@@ -587,6 +613,8 @@ async def _subscribe_new_option_keys():
     if not new_keys: return
     await _sub_binary(state.upstox_ws, new_keys, "full")
     state.subscribed_option_keys.update(new_keys)
+    # Rebuild option_key_map from current state (removes stale keys from old strikes)
+    option_key_map.clear()
     for st in loc_engine.symbols.values():
         if st.ce.instrument_key: option_key_map[st.ce.instrument_key] = (st.symbol,"CE")
         if st.pe.instrument_key: option_key_map[st.pe.instrument_key] = (st.symbol,"PE")
