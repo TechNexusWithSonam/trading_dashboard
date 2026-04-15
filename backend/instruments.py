@@ -155,6 +155,25 @@ async def fetch_expiry_list(symbol: str, token: str) -> list:
     return calculate_expiries_fallback(symbol)
 
 # ── MCX option chain (built from contracts + quotes) ────────────
+def _mcx_underlying_for_expiry(symbol: str, expiry: str) -> str:
+    """Pick the MCX futures underlying whose month matches the requested option
+    expiry. MCX options are tied to a specific month's futures contract, so
+    May options live under May futures, June options under June futures, etc.
+    Returns "" if the instrument master hasn't been loaded or no match found.
+    """
+    if not expiry or len(expiry) < 7 or not _mcx_sym_to_key:
+        return ""
+    try:
+        yr = int(expiry[:4]); mo = int(expiry[5:7])
+    except Exception:
+        return ""
+    mon_str = f"{str(yr)[2:]}{_M[mo - 1]}"   # e.g. "26MAY"
+    target = f"{symbol.upper()}{mon_str}FUT"
+    if target in _mcx_sym_to_key:
+        return _mcx_sym_to_key[target]
+    return ""
+
+
 async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
     """
     Build MCX option chain from /v2/option/contract + /v2/market-quote/quotes.
@@ -164,8 +183,12 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
     spot_key  = spot_keys.get(symbol.upper(), "")
     if not spot_key or not expiry: return {}
 
-    # Use option underlying key if different from spot key (e.g., GOLD)
-    option_key = _mcx_option_underlying.get(symbol.upper(), spot_key)
+    # MCX options are listed under the futures contract of the same month.
+    # When the requested expiry belongs to a later month than the current
+    # spot futures, resolve the underlying to that month's futures key so
+    # /v2/option/contract returns the right strikes.
+    option_key = _mcx_underlying_for_expiry(symbol, expiry) or \
+                 _mcx_option_underlying.get(symbol.upper(), spot_key)
 
     try:
         async with httpx.AsyncClient(timeout=20) as c:
@@ -181,8 +204,19 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
             filtered = [ct for ct in contracts
                         if isinstance(ct, dict) and ct.get("expiry") == expiry]
             if not filtered:
-                print(f"[MCXChain] {symbol}/{expiry} no contracts")
-                return {}
+                # Fallback: if the month-matched underlying returned nothing,
+                # try the canonical option underlying key as well.
+                canonical = _mcx_option_underlying.get(symbol.upper(), spot_key)
+                if canonical and canonical != option_key:
+                    r2 = await c.get(UPSTOX_CONTRACTS,
+                                     params={"instrument_key": canonical},
+                                     headers=_h(token))
+                    if r2.status_code == 200:
+                        filtered = [ct for ct in r2.json().get("data", [])
+                                    if isinstance(ct, dict) and ct.get("expiry") == expiry]
+                if not filtered:
+                    print(f"[MCXChain] {symbol}/{expiry} no contracts (underlying={option_key})")
+                    return {}
 
             # Step 2: Group by strike
             strike_map = {}  # strike → {CE: key, PE: key}
