@@ -556,19 +556,19 @@ async def fetch_option_ohlc_rest(ce_key: str, pe_key: str, token: str) -> dict:
                         matched_key = pe_key
                 if not matched_key:
                     continue
-                    ohlc = val.get("ohlc") or {}
-                    ltp = float(val.get("last_price") or 0)
-                    net_change = float(val.get("net_change") or 0)
-                    # Derive previous close from net_change (ohlc.close = today's close = LTP)
-                    prev_close = round(ltp - net_change, 2) if ltp and net_change else 0
-                    result[matched_key] = {
-                        "ltp":   ltp,
-                        "close": prev_close,
-                        "high":  float(ohlc.get("high")  or 0),
-                        "low":   float(ohlc.get("low")   or 0),
-                        "open":  float(ohlc.get("open")  or 0),
-                        "oi":    float(val.get("oi")      or 0),
-                    }
+                ohlc = val.get("ohlc") or {}
+                ltp = float(val.get("last_price") or 0)
+                net_change = float(val.get("net_change") or 0)
+                # Derive previous close from net_change (ohlc.close = today's close = LTP)
+                prev_close = round(ltp - net_change, 2) if ltp and net_change else 0
+                result[matched_key] = {
+                    "ltp":   ltp,
+                    "close": prev_close,
+                    "high":  float(ohlc.get("high")  or 0),
+                    "low":   float(ohlc.get("low")   or 0),
+                    "open":  float(ohlc.get("open")  or 0),
+                    "oi":    float(val.get("oi")      or 0),
+                }
     except Exception as e:
         print(f"[OptOHLC] {e}")
     return result

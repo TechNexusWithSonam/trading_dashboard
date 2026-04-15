@@ -620,12 +620,37 @@ async def _subscribe_new_option_keys():
         if st.pe.instrument_key: option_key_map[st.pe.instrument_key] = (st.symbol,"PE")
     print(f"[Options] Subscribed {len(new_keys)} option keys: {new_keys[:2]}")
 
+async def _refresh_prev_close_cache():
+    """Re-derive state.prev_close from REST so MCX fallback doesn't go stale
+    across trading days. net_change is authoritative (ltp - net_change = prev close)."""
+    if not state.access_token: return
+    try:
+        stock_comm_keys = list(dict.fromkeys(_ik.FO_STOCK_KEYS + COMMODITY_KEYS[:5]))
+        data = await fetch_quotes_rest(stock_comm_keys, state.access_token)
+        idx_data = await fetch_index_quotes(INDEX_KEYS, state.access_token)
+        data.update(idx_data)
+        updated = 0
+        for k, v in data.items():
+            cp = v.get("ltpc",{}).get("cp", 0)
+            if cp:
+                state.prev_close[k] = cp
+                updated += 1
+        print(f"[PrevClose] Refreshed cache: {updated} instruments")
+    except Exception as e:
+        print(f"[PrevClose] refresh error: {e}")
+
+
 async def periodic_refresh():
+    tick = 0
     while True:
         await asyncio.sleep(60)
         if not state.access_token: continue
         await loc_engine.refresh_all_chains()
         await _subscribe_new_option_keys()
+        tick += 1
+        # Refresh prev_close cache every 10 minutes so MCX/stale-day values recover
+        if tick % 10 == 0:
+            await _refresh_prev_close_cache()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -688,11 +713,18 @@ async def broadcast(msg: dict):
         msg["feeds"] = feeds
         for k, fv in feeds.items():
             ltp, cp, o, h, l = _ex(fv)
-            # Always prefer REST-derived prev_close (from net_change) as the
-            # authoritative source.  WS ltpc.cp for MCX instruments often
-            # equals the current LTP instead of the actual previous close.
-            if k in state.prev_close:
+            # WS ltpc.cp is the previous-day close for indices/stocks and
+            # should be trusted. For MCX the WS value is unreliable (often
+            # equals today's LTP), so fall back to the REST-derived value.
+            # Also fall back if WS gave 0 or (suspiciously) == ltp.
+            is_mcx = k.startswith("MCX")
+            ws_cp_bad = (not cp) or (is_mcx and ltp and abs(cp - ltp) < 0.01)
+            if ws_cp_bad and k in state.prev_close:
                 cp = state.prev_close[k]
+            # Keep the REST cache refreshed from trustworthy WS values so it
+            # doesn't go stale across trading days.
+            elif cp and not is_mcx:
+                state.prev_close[k] = cp
             fv.setdefault("ltpc",{})["cp"] = cp
             # Merge efeed: preserve day open/high/low from REST snapshot
             existing = state.market_data.get(k, {})
