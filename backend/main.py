@@ -68,7 +68,8 @@ SPOT_KEYS_D: dict = {}   # filled at startup
 
 # Feed key → LOC symbol (for routing to LOC engine)
 FEED_KEY_TO_SYM: dict = {}
-option_key_map:  dict = {}   # option_key → (symbol, "CE"/"PE")
+option_key_map:      dict = {}   # LOC option key → (symbol, "CE"/"PE")
+calc_option_key_map: dict = {}   # Calculator option key → (symbol, "CE"/"PE")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -387,17 +388,44 @@ def _route_tick(key, ltp, cp, o, h, l, ts):
     if sym and sym in LOC_SYMBOLS_SET:
         loc_engine.update_spot(sym, ltp, cp, h, l, ts, o)
         return
-    if key in option_key_map:
-        sym, opt_type = option_key_map[key]
-        # Validate this key is still the active option for this symbol
-        # (prevents stale keys from overwriting new strike data after ATM shift)
-        st = loc_engine.get_state(sym)
+    # ── LOC option routing ─────────────────────────────────────────
+    mapping = option_key_map.get(key)
+    if not mapping:
+        for st in loc_engine.symbols.values():
+            if st.ce.instrument_key == key:
+                mapping = (st.symbol, "CE"); break
+            if st.pe.instrument_key == key:
+                mapping = (st.symbol, "PE"); break
+        if mapping:
+            option_key_map[key] = mapping
+    if mapping:
+        sym_m, opt_type = mapping
+        st = loc_engine.get_state(sym_m)
         if st:
-            current_key = st.ce.instrument_key if opt_type == "CE" else st.pe.instrument_key
-            if key != current_key:
-                del option_key_map[key]
-                return
-        loc_engine.update_option_from_feed(sym, opt_type, ltp, cp, h, l)
+            cur = st.ce.instrument_key if opt_type == "CE" else st.pe.instrument_key
+            if key != cur:
+                option_key_map.pop(key, None)
+            else:
+                loc_engine.update_option_from_feed(sym_m, opt_type, ltp, cp, h, l)
+    # ── Calculator option routing (parallel, decoupled from LOC) ───
+    cmap = calc_option_key_map.get(key)
+    if not cmap:
+        for sn, calc in loc_engine.calc_states.items():
+            if calc.ce.instrument_key == key:
+                cmap = (sn, "CE"); break
+            if calc.pe.instrument_key == key:
+                cmap = (sn, "PE"); break
+        if cmap:
+            calc_option_key_map[key] = cmap
+    if cmap:
+        sym_c, opt_type_c = cmap
+        calc = loc_engine.calc_states.get(sym_c)
+        if calc:
+            cur_c = calc.ce.instrument_key if opt_type_c == "CE" else calc.pe.instrument_key
+            if key != cur_c:
+                calc_option_key_map.pop(key, None)
+            else:
+                loc_engine.update_calc_option(sym_c, opt_type_c, ltp, cp, h, l)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -408,6 +436,12 @@ async def startup_init():
 
     # Wire up callback so chain refreshes trigger OHLC REST fetch immediately
     loc_engine.on_option_ohlc_needed = _refresh_option_ohlc_single
+    loc_engine.on_calc_option_ohlc_needed = _refresh_calc_option_ohlc
+    # Subscribe new option keys to Upstox WS the moment ATM shifts, so the
+    # newly-selected CE/PE strike starts receiving live ticks without having
+    # to wait for the next periodic_refresh cycle.
+    loc_engine.on_option_keys_changed = _subscribe_new_option_keys
+    loc_engine.on_calc_keys_changed   = _subscribe_new_option_keys
 
     print("[Init] Starting data init...")
 
@@ -606,26 +640,99 @@ async def _refresh_all_option_ohlc():
         await asyncio.sleep(0.15)
 
 
+async def _refresh_calc_option_ohlc(symbol: str):
+    """REST OHLC refresh for a symbol's Calculator CE/PE view.
+    Separate from the LOC path so Calculator preview stays independent."""
+    if not state.access_token: return
+    calc = loc_engine.calc_states.get(symbol)
+    if not calc or not calc.ce.instrument_key: return
+    data = await fetch_option_ohlc_rest(
+        calc.ce.instrument_key, calc.pe.instrument_key, state.access_token)
+    if not data: return
+    ce_d = data.get(calc.ce.instrument_key, {})
+    pe_d = data.get(calc.pe.instrument_key, {})
+    changed = False
+    if ce_d:
+        if not calc.ce.ltp and ce_d.get("ltp"):
+            calc.ce.ltp = ce_d["ltp"]; changed = True
+        if ce_d.get("close"):
+            calc.ce.close = ce_d["close"]; changed = True
+        if ce_d.get("high"):
+            calc.ce.high = max(calc.ce.high, ce_d["high"]) if calc.ce.high else ce_d["high"]
+            changed = True
+        if ce_d.get("low"):
+            calc.ce.low = min(calc.ce.low, ce_d["low"]) if calc.ce.low else ce_d["low"]
+            changed = True
+    if pe_d:
+        if not calc.pe.ltp and pe_d.get("ltp"):
+            calc.pe.ltp = pe_d["ltp"]; changed = True
+        if pe_d.get("close"):
+            calc.pe.close = pe_d["close"]; changed = True
+        if pe_d.get("high"):
+            calc.pe.high = max(calc.pe.high, pe_d["high"]) if calc.pe.high else pe_d["high"]
+            changed = True
+        if pe_d.get("low"):
+            calc.pe.low = min(calc.pe.low, pe_d["low"]) if calc.pe.low else pe_d["low"]
+            changed = True
+    if changed:
+        loc_engine._recalc_calc(symbol)
+
+
 async def _subscribe_new_option_keys():
     if not state.upstox_ws: return
-    new_keys = [k for k in loc_engine.get_option_keys()
-                if k and k not in state.subscribed_option_keys]
-    if not new_keys: return
-    await _sub_binary(state.upstox_ws, new_keys, "full")
-    state.subscribed_option_keys.update(new_keys)
-    # Rebuild option_key_map from current state (removes stale keys from old strikes)
+    loc_keys  = [k for k in loc_engine.get_option_keys() if k]
+    calc_keys = [k for k in loc_engine.get_calc_option_keys() if k]
+    all_keys  = list(dict.fromkeys(loc_keys + calc_keys))
+    new_keys  = [k for k in all_keys if k not in state.subscribed_option_keys]
+    if new_keys:
+        await _sub_binary(state.upstox_ws, new_keys, "full")
+        state.subscribed_option_keys.update(new_keys)
+        print(f"[Options] Subscribed {len(new_keys)} option keys: {new_keys[:2]}")
+    # Always rebuild BOTH maps from current engine state — even when no new
+    # WS subscription is needed. An ATM shift back to a previously-seen
+    # strike leaves the strike in state.subscribed_option_keys (so new_keys
+    # is empty) but changes the instrument_key, so without this rebuild
+    # ticks for the current strike would silently miss and LTP would freeze.
     option_key_map.clear()
     for st in loc_engine.symbols.values():
         if st.ce.instrument_key: option_key_map[st.ce.instrument_key] = (st.symbol,"CE")
         if st.pe.instrument_key: option_key_map[st.pe.instrument_key] = (st.symbol,"PE")
-    print(f"[Options] Subscribed {len(new_keys)} option keys: {new_keys[:2]}")
+    calc_option_key_map.clear()
+    for sn, calc in loc_engine.calc_states.items():
+        if calc.ce.instrument_key: calc_option_key_map[calc.ce.instrument_key] = (sn,"CE")
+        if calc.pe.instrument_key: calc_option_key_map[calc.pe.instrument_key] = (sn,"PE")
+
+async def _refresh_prev_close_cache():
+    """Re-derive state.prev_close from REST so MCX fallback doesn't go stale
+    across trading days. net_change is authoritative (ltp - net_change = prev close)."""
+    if not state.access_token: return
+    try:
+        stock_comm_keys = list(dict.fromkeys(_ik.FO_STOCK_KEYS + COMMODITY_KEYS[:5]))
+        data = await fetch_quotes_rest(stock_comm_keys, state.access_token)
+        idx_data = await fetch_index_quotes(INDEX_KEYS, state.access_token)
+        data.update(idx_data)
+        updated = 0
+        for k, v in data.items():
+            cp = v.get("ltpc",{}).get("cp", 0)
+            if cp:
+                state.prev_close[k] = cp
+                updated += 1
+        print(f"[PrevClose] Refreshed cache: {updated} instruments")
+    except Exception as e:
+        print(f"[PrevClose] refresh error: {e}")
+
 
 async def periodic_refresh():
+    tick = 0
     while True:
         await asyncio.sleep(60)
         if not state.access_token: continue
         await loc_engine.refresh_all_chains()
         await _subscribe_new_option_keys()
+        tick += 1
+        # Refresh prev_close cache every 10 minutes so MCX/stale-day values recover
+        if tick % 10 == 0:
+            await _refresh_prev_close_cache()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -666,6 +773,7 @@ async def ws_browser(ws: WebSocket):
             "market_data": state.market_data,
             "market_status": state.market_status,
             "loc_results": loc_engine.get_all_results(),
+            "calc_results": loc_engine.get_all_calc_results(),
             "expiry_cache": state.expiry_cache,
             "spot_keys": SPOT_KEYS_D,
             "commodity_keys": COMMODITY_KEYS,
@@ -688,11 +796,18 @@ async def broadcast(msg: dict):
         msg["feeds"] = feeds
         for k, fv in feeds.items():
             ltp, cp, o, h, l = _ex(fv)
-            # Always prefer REST-derived prev_close (from net_change) as the
-            # authoritative source.  WS ltpc.cp for MCX instruments often
-            # equals the current LTP instead of the actual previous close.
-            if k in state.prev_close:
+            # WS ltpc.cp is the previous-day close for indices/stocks and
+            # should be trusted. For MCX the WS value is unreliable (often
+            # equals today's LTP), so fall back to the REST-derived value.
+            # Also fall back if WS gave 0 or (suspiciously) == ltp.
+            is_mcx = k.startswith("MCX")
+            ws_cp_bad = (not cp) or (is_mcx and ltp and abs(cp - ltp) < 0.01)
+            if ws_cp_bad and k in state.prev_close:
                 cp = state.prev_close[k]
+            # Keep the REST cache refreshed from trustworthy WS values so it
+            # doesn't go stale across trading days.
+            elif cp and not is_mcx:
+                state.prev_close[k] = cp
             fv.setdefault("ltpc",{})["cp"] = cp
             # Merge efeed: preserve day open/high/low from REST snapshot
             existing = state.market_data.get(k, {})
@@ -761,6 +876,7 @@ async def _flush_feed_buffer():
             "feeds": feeds,
             "currentTs": str(int(time.time() * 1000)),
             "loc_results": loc_engine.get_all_results(),
+            "calc_results": loc_engine.get_all_calc_results(),
         }
         await _send_to_clients(msg)
 
@@ -950,19 +1066,22 @@ async def get_expiry(symbol: str):
 
 @app.post("/api/expiry/{symbol}")
 async def set_expiry(symbol: str, payload: dict):
+    """Set the Calculator's active expiry for this symbol. The LOC table is
+    always pinned to the symbol's default/current-week expiry and is NOT
+    affected by this endpoint. Selecting the default expiry clears the
+    Calculator view (frontend then falls back to LOC data)."""
     sym    = symbol.upper(); expiry = payload.get("expiry","")
     if not expiry: raise HTTPException(400,"expiry required")
-    loc_engine.set_expiry(sym, expiry)
-    state.expiry_cache.setdefault(sym,{})["selected"] = expiry
-    asyncio.create_task(_refresh_chain_and_sub(sym, expiry))
-    return {"status":"ok","symbol":sym,"expiry":expiry}
-
-async def _refresh_chain_and_sub(sym: str, expiry: str):
-    chain = await fetch_option_chain(sym, expiry, state.access_token)
-    if chain: loc_engine.update_chain(sym, chain)
-    await asyncio.sleep(0.5)
-    await _refresh_option_ohlc_single(sym)
-    await _subscribe_new_option_keys()
+    info    = state.expiry_cache.get(sym, {})
+    default = info.get("default", "")
+    state.expiry_cache.setdefault(sym, {})["selected"] = expiry
+    if default and expiry == default:
+        # Revert Calculator to the LOC default — discard the calc view.
+        loc_engine.clear_calc_expiry(sym)
+        return {"status":"ok","symbol":sym,"expiry":expiry,"mode":"loc"}
+    # Non-default: set up a calc view for the requested expiry.
+    asyncio.create_task(loc_engine.set_calc_expiry(sym, expiry))
+    return {"status":"ok","symbol":sym,"expiry":expiry,"mode":"calc"}
 
 @app.get("/api/ohlc/{key:path}")
 async def get_ohlc(key: str):
@@ -1077,6 +1196,22 @@ async def debug_chain(symbol: str):
         "pe_strike":st.pe_strike,"pe_ltp":st.pe.ltp,"pe_close":st.pe.close,
         "pe_high":st.pe.high,"pe_low":st.pe.low,"pe_key":st.pe.instrument_key,
         "chain_size":len(st.option_chain),"loc":st.loc_result,
+    }
+
+@app.get("/api/debug/calc/{symbol}")
+async def debug_calc(symbol: str):
+    """Inspect the Calculator-only view for this symbol (independent of LOC)."""
+    calc = loc_engine.get_calc_state(symbol.upper())
+    if not calc: return {"active": False, "message": "no calc view set"}
+    return {
+        "active": True,
+        "expiry": calc.expiry,
+        "ce_strike": calc.ce_strike, "ce_ltp": calc.ce.ltp, "ce_close": calc.ce.close,
+        "ce_high": calc.ce.high, "ce_low": calc.ce.low, "ce_key": calc.ce.instrument_key,
+        "pe_strike": calc.pe_strike, "pe_ltp": calc.pe.ltp, "pe_close": calc.pe.close,
+        "pe_high": calc.pe.high, "pe_low": calc.pe.low, "pe_key": calc.pe.instrument_key,
+        "chain_size": len(calc.option_chain),
+        "result": calc.result,
     }
 
 @app.get("/api/debug/mcx")
