@@ -171,10 +171,14 @@ class LOCEngine:
         st=self.symbols.get(symbol)
         if not st or not ltp: return
         st.spot.ltp  = ltp
-        st.spot.close= close or ltp
-        st.spot.high = high  or ltp
-        st.spot.low  = low   or ltp
-        st.spot.open = open_ or ltp
+        # Only overwrite OHLC fields when the caller supplied a real value.
+        # Partial WS ticks send only ltp/cp; the old `or ltp` fallback wrote
+        # ltp into high/low/open and clobbered the real session values that
+        # an earlier full tick (or REST snapshot) had set.
+        if close > 0: st.spot.close = close
+        if high  > 0: st.spot.high  = high
+        if low   > 0: st.spot.low   = low
+        if open_ > 0: st.spot.open  = open_
         st.spot.ts   = ts
 
         # ATM shift detection — use debounce (only act if ATM actually changes)
@@ -230,6 +234,12 @@ class LOCEngine:
         only be set once. We do NOT overwrite it on every tick because for
         options, once set from REST (which derives it from net_change), the
         REST value is authoritative. WS cp can be used as initial seed only.
+
+        High/low: Upstox WS feed sends the AUTHORITATIVE session high/low
+        in efeed.high / efeed.low — overwrite directly when provided. The
+        prior max/min accumulation caused yesterday's session high to
+        persist when today's high was lower. Partial ticks (where efeed
+        lacks these fields) are skipped via the `> 0` guard.
         """
         st=self.symbols.get(symbol)
         if not st: return
@@ -239,10 +249,10 @@ class LOCEngine:
         # Only seed close from WS if we have no close yet (REST hasn't arrived)
         if close and close>0 and not opt.close:
             opt.close = close
-        if high and high>0:
-            opt.high = max(opt.high, high) if opt.high else high
-        if low and low>0:
-            opt.low  = min(opt.low, low)   if opt.low  else low
+        if high > 0:
+            opt.high = high
+        if low > 0:
+            opt.low = low
         self._recalc(symbol)
 
     def update_chain(self, symbol:str, chain:dict):
@@ -320,6 +330,11 @@ class LOCEngine:
                 except: pass
             return 0.0
 
+        # Every chain refresh gets today's authoritative prev-close + session
+        # high/low from Upstox. Overwrite directly — the old max/min
+        # accumulation and `not st.pe.close` guard caused yesterday's values
+        # to persist into today's session whenever today's numbers were
+        # smaller or a close had already been seeded.
         if ce_row.get("CE"):
             c = ce_row["CE"]
             new_ce_key = c.get("key", "")
@@ -330,23 +345,21 @@ class LOCEngine:
             # or we have no WS data yet. WS LTP is real-time and authoritative.
             if key_changed or not st.ce.ltp:
                 st.ce.ltp = chain_ltp
-            # Close: update from chain (chain close_price is prev day's close for NSE,
-            # net_change-derived for MCX). Only overwrite if chain has a value.
-            if chain_close and (key_changed or not st.ce.close):
+            # Close: chain close_price is prev day's close for NSE, net_change-
+            # derived for MCX. Always refresh when chain returns a value.
+            if chain_close:
                 st.ce.close = chain_close
-            # Only overwrite high/low from chain if chain has actual values.
-            # If chain returns 0/None, preserve existing values from OHLC REST.
-            # Reset to ltp only when the option instrument changed (ATM shift).
+            # High/low: chain reports today's session extremes. Overwrite when
+            # the chain has a value; fall back to ltp only when both chain is
+            # empty and we have no prior high/low (first-load or ATM shift).
             chain_high = _best(c.get("high"))
             chain_low  = _best(c.get("low"))
             if chain_high:
-                if key_changed: st.ce.high = chain_high
-                else: st.ce.high = max(st.ce.high, chain_high) if st.ce.high else chain_high
+                st.ce.high = chain_high
             elif key_changed or not st.ce.high:
                 st.ce.high = chain_ltp
             if chain_low:
-                if key_changed: st.ce.low = chain_low
-                else: st.ce.low = min(st.ce.low, chain_low) if st.ce.low else chain_low
+                st.ce.low = chain_low
             elif key_changed or not st.ce.low:
                 st.ce.low = chain_ltp
             st.ce.oi    = float(c.get("oi") or 0)
@@ -361,18 +374,16 @@ class LOCEngine:
             chain_close = _best(p.get("close"), p.get("ltp"))
             if key_changed or not st.pe.ltp:
                 st.pe.ltp = chain_ltp
-            if chain_close and (key_changed or not st.pe.close):
+            if chain_close:
                 st.pe.close = chain_close
             chain_high = _best(p.get("high"))
             chain_low  = _best(p.get("low"))
             if chain_high:
-                if key_changed: st.pe.high = chain_high
-                else: st.pe.high = max(st.pe.high, chain_high) if st.pe.high else chain_high
+                st.pe.high = chain_high
             elif key_changed or not st.pe.high:
                 st.pe.high = chain_ltp
             if chain_low:
-                if key_changed: st.pe.low = chain_low
-                else: st.pe.low = min(st.pe.low, chain_low) if st.pe.low else chain_low
+                st.pe.low = chain_low
             elif key_changed or not st.pe.low:
                 st.pe.low = chain_ltp
             st.pe.oi    = float(p.get("oi") or 0)

@@ -39,13 +39,14 @@ FEED_URL     = "wss://api.upstox.com/v3/feed/market-data-feed"
 PASSWORD     = os.getenv("DASHBOARD_PASSWORD", "raima2024")
 
 from .instruments import (
-    get_spot_keys, mcx_key, get_current_and_next_expiry, get_itm2_strikes,
+    get_spot_keys, mcx_key, mcx_key_for_month, get_current_and_next_expiry, get_itm2_strikes,
     fetch_expiry_list, fetch_option_chain, fetch_quotes_rest, fetch_index_quotes,
     fetch_option_ohlc_rest, fetch_intraday_candles,
     validate_mcx_keys, calculate_expiries_fallback,
     normalize_mcx_response_key, normalize_response_key,
     refresh_nse_eq_keys, STRIKE_STEPS, MONTHLY_SYMBOLS
 )
+from . import instruments as _instruments_mod
 from . import instrument_keys as _ik
 from .instrument_keys import NSE_EQ_KEYS
 from .loc_engine import LOCEngine
@@ -304,9 +305,13 @@ def _ex(fv):
     ltpc=fv.get("ltpc",{}); ef=fv.get("efeed",{})
     ltp = float(ltpc.get("ltp",0))
     cp  = float(ltpc.get("cp",0) or ef.get("cp",0))
-    h   = float(ef.get("high",0) or ltp)
-    l   = float(ef.get("low",0)  or ltp)
-    o   = float(ef.get("open",0) or ltp)
+    # Return raw 0 when efeed fields are absent rather than falling back to ltp.
+    # The `or ltp` fallback used to hide partial ticks from callers but caused
+    # update_spot / update_option_from_feed to overwrite real session high/low
+    # with the current ltp. Callers now treat 0 as "no update for this field".
+    h   = float(ef.get("high",0))
+    l   = float(ef.get("low",0))
+    o   = float(ef.get("open",0))
     return ltp, cp, o, h, l
 
 
@@ -511,6 +516,21 @@ async def startup_init():
     await asyncio.gather(*[_init_expiry(s) for s in stock_syms])
     print(f"[Init] All expiries loaded: {len(state.expiry_cache)} symbols")
 
+    # Step 5.5: Align MCX spot futures with the active option month.
+    # validate_mcx_keys() picks the nearest futures by month >= today, so on
+    # 17 Apr it still picks April futures even though April options died on
+    # 16 Apr. Now that expiries are known, point the spot at whichever
+    # month's options are actually live (info["default"]).
+    global _last_rollover_check_date
+    _align_mcx_spot_to_options()
+    from datetime import date as _dc_init
+    _last_rollover_check_date = _dc_init.today()
+    # Prime spot OHLC (open/high/low/close) for the rolled-over MCX futures
+    # via REST so the LOC engine's spot isn't stuck at `ltp` when WS ticks
+    # haven't arrived (e.g. weekends, pre-open). Runs unconditionally — if
+    # the spot key didn't change this still refreshes stale prev-close data.
+    await _prime_mcx_spot_from_rest()
+
     await broadcast({"type":"expiry_update","expiry_cache":state.expiry_cache})
 
     # Step 6: Fetch option chains — parallel with concurrency limit
@@ -606,6 +626,10 @@ async def _refresh_option_ohlc_single(symbol: str):
     ce_d = data.get(st.ce.instrument_key, {})
     pe_d = data.get(st.pe.instrument_key, {})
     changed = False
+    # Upstox /v2/quotes ohlc.high / ohlc.low are the AUTHORITATIVE session
+    # high/low as of the response timestamp — overwrite, don't max/min
+    # accumulate across days. The old max/min caused yesterday's session
+    # high to persist into today's values whenever today's high was lower.
     if ce_d:
         # Only seed LTP if WS hasn't provided one yet
         if not st.ce.ltp and ce_d.get("ltp"):
@@ -614,9 +638,9 @@ async def _refresh_option_ohlc_single(symbol: str):
         if ce_d.get("close"):
             st.ce.close = ce_d["close"]
         if ce_d.get("high"):
-            st.ce.high = max(st.ce.high, ce_d["high"]) if st.ce.high else ce_d["high"]
+            st.ce.high = ce_d["high"]
         if ce_d.get("low"):
-            st.ce.low = min(st.ce.low, ce_d["low"]) if st.ce.low else ce_d["low"]
+            st.ce.low = ce_d["low"]
         changed = True
     if pe_d:
         if not st.pe.ltp and pe_d.get("ltp"):
@@ -625,9 +649,9 @@ async def _refresh_option_ohlc_single(symbol: str):
         if pe_d.get("close"):
             st.pe.close = pe_d["close"]
         if pe_d.get("high"):
-            st.pe.high = max(st.pe.high, pe_d["high"]) if st.pe.high else pe_d["high"]
+            st.pe.high = pe_d["high"]
         if pe_d.get("low"):
-            st.pe.low = min(st.pe.low, pe_d["low"]) if st.pe.low else pe_d["low"]
+            st.pe.low = pe_d["low"]
         changed = True
     if changed:
         loc_engine.recalc(symbol)
@@ -722,11 +746,306 @@ async def _refresh_prev_close_cache():
         print(f"[PrevClose] refresh error: {e}")
 
 
+def _align_mcx_spot_to_options() -> list:
+    """Re-point each MCX symbol's spot key at the futures contract that
+    matches its currently-active option expiry month. Reads
+    `state.expiry_cache` (must already be populated) and mutates
+    `_validated_mcx`, `SPOT_KEYS_D`, `FEED_KEY_TO_SYM`, and `COMMODITY_KEYS`
+    in place. Returns a list of (sym, old_key, new_key, default_expiry)
+    tuples for rolled-over symbols so callers can decide whether to
+    re-subscribe the WS feed."""
+    global COMMODITY_KEYS
+    from datetime import date as _dc
+    today_d = _dc.today()
+    rolled = []
+    for sym in _MCX_LOC:
+        info = state.expiry_cache.get(sym) or {}
+        defx = info.get("default") or ""
+        if len(defx) < 7: continue
+        try:
+            yr = int(defx[:4]); mo = int(defx[5:7])
+        except Exception:
+            continue
+        if (yr, mo) == (today_d.year, today_d.month):
+            continue  # default option is in the current calendar month
+        new_spot = mcx_key_for_month(sym, yr, mo)
+        tail = new_spot.split("|", 1)[1] if "|" in new_spot else ""
+        if not tail or not tail[:1].isdigit():
+            continue  # name-based fallback — not a real master key
+        old_spot = _instruments_mod._validated_mcx.get(sym) or SPOT_KEYS_D.get(sym)
+        if old_spot == new_spot:
+            continue
+        _instruments_mod._validated_mcx[sym] = new_spot
+        SPOT_KEYS_D[sym] = new_spot
+        if old_spot and FEED_KEY_TO_SYM.get(old_spot) == sym:
+            del FEED_KEY_TO_SYM[old_spot]
+        FEED_KEY_TO_SYM[new_spot] = sym
+        rolled.append((sym, old_spot, new_spot, defx))
+        print(f"[MCX Rollover] {sym}: {old_spot} → {new_spot} (active option expiry={defx})")
+
+    if rolled:
+        primary = [SPOT_KEYS_D[s] for s in _MCX_LOC if s in SPOT_KEYS_D]
+        next_mo = []
+        for s in _MCX_LOC:
+            nm = (state.expiry_cache.get(s) or {}).get("next_month") or ""
+            if len(nm) < 7: continue
+            try:
+                yr2 = int(nm[:4]); mo2 = int(nm[5:7])
+            except Exception:
+                continue
+            k2 = mcx_key_for_month(s, yr2, mo2)
+            t2 = k2.split("|", 1)[1] if "|" in k2 else ""
+            if t2 and t2[:1].isdigit():
+                next_mo.append(k2)
+        COMMODITY_KEYS = list(dict.fromkeys(primary + next_mo))
+        print(f"[MCX Rollover] COMMODITY_KEYS rebuilt: {COMMODITY_KEYS}")
+    return rolled
+
+
+_last_rollover_check_date = None  # set on first periodic tick
+
+
+async def _prime_mcx_spot_from_rest():
+    """Fetch live /v2 quotes for the 5 MCX spot futures and populate
+    state.market_data + loc_engine spot OHLC. Without this, the LOC
+    engine's spot high/low/close are 0 until the Upstox WS feed delivers
+    a tick — which doesn't happen on weekends or outside market hours,
+    so the UI shows spot_high = spot_low = spot_close = ltp. This is
+    cheap (one /v2/quotes call for 5 keys) and idempotent."""
+    if not state.access_token: return
+    keys = list(dict.fromkeys([SPOT_KEYS_D[s] for s in _MCX_LOC if s in SPOT_KEYS_D]))
+    if not keys: return
+    try:
+        data = await fetch_quotes_rest(keys, state.access_token)
+    except Exception as e:
+        print(f"[MCX Prime] fetch error: {e}")
+        return
+    if not data:
+        print(f"[MCX Prime] /v2 quotes returned no data for keys={keys}")
+        return
+    updated = 0
+    ts_ms = int(time.time() * 1000)
+    for k, v in data.items():
+        sym = FEED_KEY_TO_SYM.get(k, "")
+        state.market_data[k] = {**v, "ts": str(ts_ms), "display_name": sym}
+        ltp = v.get("ltpc", {}).get("ltp", 0)
+        cp  = v.get("ltpc", {}).get("cp", 0)
+        if cp: state.prev_close[k] = cp
+        if ltp and sym and sym in LOC_SYMBOLS_SET:
+            ef = v.get("efeed", {})
+            loc_engine.update_spot(
+                sym, ltp, cp or ltp,
+                ef.get("high", ltp), ef.get("low", ltp),
+                ts_ms, ef.get("open", ltp))
+            updated += 1
+    print(f"[MCX Prime] Refreshed spot OHLC for {updated} MCX symbols")
+
+
+async def _process_expiry_rollovers(syms: list, parallel: bool = False) -> list:
+    """For each symbol, detect whether its default option expiry has
+    advanced since the last check. Returns a list of
+    (sym, old_default, new_default) for symbols that rolled.
+
+    Optimization — most days no symbol rolls, so we want to avoid hitting
+    Upstox ~100 times. We first recompute `get_current_and_next_expiry()`
+    from the CACHED expiry list. If the recomputed default equals the
+    stored default, the symbol hasn't rolled — no HTTP call made. Only
+    symbols whose cached default has advanced (or whose cache is empty)
+    trigger a fresh fetch to pick up any newly-published far-future
+    expiries from Upstox.
+
+    When `parallel=True`, fetches run concurrently under a semaphore(5)
+    — appropriate for the ~130 F&O stock sweep. Priority symbols (indices
+    + MCX) run sequentially to guarantee predictable ordering.
+    """
+    rolled = []
+    need_fetch = []
+
+    for sym in syms:
+        cached = state.expiry_cache.get(sym) or {}
+        cached_default = cached.get("default") or ""
+        cached_all = cached.get("all") or []
+        if cached_all:
+            recomputed = get_current_and_next_expiry(cached_all, sym)
+            # Apply recompute to update current_week/next_week labels that may
+            # have shifted even before an Upstox fetch (cheap, no HTTP).
+            state.expiry_cache[sym] = recomputed
+            if (recomputed.get("default") or "") == cached_default:
+                continue  # default stable — no fetch, no rollover
+        # Default advanced via the cached list, OR cache is empty — fetch fresh
+        need_fetch.append((sym, cached_default))
+
+    if not need_fetch: return rolled
+
+    async def _fetch_one(sym, old_default):
+        try:
+            expiries = await fetch_expiry_list(sym, state.access_token)
+            info = get_current_and_next_expiry(expiries, sym)
+            state.expiry_cache[sym] = info
+            new_default = info.get("default") or ""
+            if new_default and new_default != old_default:
+                loc_engine.set_expiry(sym, new_default, fetch_chain=False)
+                print(f"[Rollover] {sym} expiry: {old_default or '—'} → {new_default}")
+                return (sym, old_default, new_default)
+        except Exception as e:
+            print(f"[Rollover] {sym} expiry refresh: {e}")
+        return None
+
+    if parallel:
+        sem = asyncio.Semaphore(5)
+        async def _bounded(sym, old):
+            async with sem:
+                r = await _fetch_one(sym, old)
+                await asyncio.sleep(0.1)
+                return r
+        results = await asyncio.gather(*[_bounded(s, d) for s, d in need_fetch])
+        rolled = [r for r in results if r]
+    else:
+        for sym, old_default in need_fetch:
+            r = await _fetch_one(sym, old_default)
+            if r: rolled.append(r)
+            await asyncio.sleep(0.15)
+    return rolled
+
+
+async def _refresh_chains_for_rolled(chain_refresh: dict, parallel: bool = False):
+    """Fetch fresh option chain + CE/PE OHLC for each rolled symbol.
+    `chain_refresh` maps sym → expiry to fetch. Uses a semaphore to avoid
+    overwhelming Upstox when the F&O stock batch rolls on last-Thursday."""
+    if not chain_refresh: return
+
+    sem = asyncio.Semaphore(3)
+
+    async def _one_chain(sym, expiry):
+        async with sem:
+            try:
+                chain = await fetch_option_chain(sym, expiry, state.access_token)
+                if chain:
+                    loc_engine.update_chain(sym, chain)
+            except Exception as e:
+                print(f"[Rollover] {sym} chain: {e}")
+            await asyncio.sleep(0.2)
+
+    if parallel:
+        await asyncio.gather(*[_one_chain(s, e) for s, e in chain_refresh.items()])
+    else:
+        for s, e in chain_refresh.items():
+            await _one_chain(s, e)
+
+    # CE/PE OHLC (close/high/low) via REST — chain data often has 0s.
+    # Serial with small sleep: per-symbol cost is ~200 ms, so 100 stocks
+    # is ~20 s but runs in a background task, so UI isn't blocked.
+    for sym in chain_refresh:
+        try:
+            await _refresh_option_ohlc_single(sym)
+        except Exception as e:
+            print(f"[Rollover] {sym} option OHLC: {e}")
+        await asyncio.sleep(0.1)
+
+
+async def _daily_rollover_check():
+    """Fires once per calendar day from periodic_refresh. Rolls over LOC
+    symbols whose current `default` option expiry has passed:
+
+      • Indices (NIFTY/SENSEX weekly + BANKNIFTY/FINNIFTY/MIDCPNIFTY/BANKEX monthly)
+      • MCX commodities (monthly; spot futures realigned to active option month)
+      • F&O stocks (~130 symbols, monthly)
+
+    Phase A (priority, blocking): indices + MCX. Runs expiry check,
+    MCX spot alignment + OHLC prime, chain + CE/PE OHLC refresh for rolled
+    symbols, WS re-subscription. Broadcasts so UI updates within ~10 s.
+
+    Phase B (background): F&O stocks. Runs in parallel under a
+    semaphore(5) for expiries and semaphore(3) for chains. The cache-first
+    optimization means on a typical day with no expiries passing, Phase B
+    finishes in ~1 s with zero HTTP calls.
+    """
+    global _last_rollover_check_date
+    from datetime import date as _dc
+    today_d = _dc.today()
+    if _last_rollover_check_date == today_d: return
+    _last_rollover_check_date = today_d
+    if not state.access_token: return
+
+    # ── Phase A: indices + MCX (priority, sequential) ──
+    priority = _INDEX_LOC + _MCX_LOC
+    priority_rolled = await _process_expiry_rollovers(priority, parallel=False)
+
+    mcx_spot_rolled = _align_mcx_spot_to_options()
+    await _prime_mcx_spot_from_rest()
+
+    # Chain refresh set: union of expiry-rolled and MCX-spot-rolled
+    chain_refresh = {sym: new_def for sym, _o, new_def in priority_rolled}
+    for sym, _ok, _nk, defx in mcx_spot_rolled:
+        chain_refresh.setdefault(sym, defx)
+
+    await _refresh_chains_for_rolled(chain_refresh, parallel=False)
+
+    if state.upstox_ws:
+        if mcx_spot_rolled and COMMODITY_KEYS:
+            try:
+                await _sub_binary(state.upstox_ws, COMMODITY_KEYS, "full")
+                print(f"[Rollover] Re-subscribed MCX keys: {COMMODITY_KEYS}")
+            except Exception as e:
+                print(f"[Rollover] MCX re-sub: {e}")
+        try:
+            await _subscribe_new_option_keys()
+        except Exception as e:
+            print(f"[Rollover] option re-sub: {e}")
+
+    # Broadcast priority results so UI updates fast
+    await broadcast({
+        "type": "snapshot_update",
+        "market_data": state.market_data,
+        "commodity_keys": COMMODITY_KEYS,
+        "spot_keys": SPOT_KEYS_D,
+        "expiry_cache": state.expiry_cache,
+        "loc_results": loc_engine.get_all_results(),
+    })
+    print(f"[Rollover] Phase A done: {len(priority_rolled)} priority expiry rolls, "
+          f"{len(mcx_spot_rolled)} MCX spot rolls, {len(chain_refresh)} chains refreshed")
+
+    # ── Phase B: F&O stocks (background, parallel) ──
+    async def _stocks_background():
+        stock_syms = [s for s in LOC_SYMBOLS if s not in priority]
+        stock_rolled = await _process_expiry_rollovers(stock_syms, parallel=True)
+        if not stock_rolled:
+            # Possibly nothing rolled — still broadcast expiry_cache since
+            # current_week/next_week labels may have shifted via recompute.
+            await broadcast({
+                "type": "snapshot_update",
+                "expiry_cache": state.expiry_cache,
+            })
+            print(f"[Rollover] Phase B done: 0 stock rolls")
+            return
+        chain_refresh_b = {sym: new_def for sym, _o, new_def in stock_rolled}
+        await _refresh_chains_for_rolled(chain_refresh_b, parallel=True)
+        if state.upstox_ws:
+            try:
+                await _subscribe_new_option_keys()
+            except Exception as e:
+                print(f"[Rollover] Phase B option re-sub: {e}")
+        await broadcast({
+            "type": "snapshot_update",
+            "expiry_cache": state.expiry_cache,
+            "loc_results": loc_engine.get_all_results(),
+        })
+        print(f"[Rollover] Phase B done: {len(stock_rolled)} stock rolls, "
+              f"{len(chain_refresh_b)} chains refreshed")
+
+    asyncio.create_task(_stocks_background())
+
+
 async def periodic_refresh():
     tick = 0
     while True:
         await asyncio.sleep(60)
         if not state.access_token: continue
+        # Day-change rollover: detect once per new calendar day.
+        try:
+            await _daily_rollover_check()
+        except Exception as e:
+            print(f"[Rollover] check error: {e}")
         await loc_engine.refresh_all_chains()
         await _subscribe_new_option_keys()
         tick += 1
@@ -828,10 +1147,13 @@ async def broadcast(msg: dict):
                                   merged_ef.get("open",ltp),
                                   merged_ef.get("high",ltp),
                                   merged_ef.get("low",ltp))
-            _route_tick(k, ltp, cp,
-                        merged_ef.get("open",ltp),
-                        merged_ef.get("high",ltp),
-                        merged_ef.get("low",ltp), ts)
+            # Route using raw values from this tick only (via _ex). If the
+            # tick omits a field, pass 0 — update_spot / update_option_from_feed
+            # treat 0 as "skip this field" and preserve the prior session
+            # value. Previously we passed merged_ef.* which inherited
+            # yesterday's efeed on the first partial tick of a new session,
+            # clobbering today's real high/low via the `or ltp` fallback.
+            _route_tick(k, ltp, cp, o, h, l, ts)
         # Buffer feeds for throttled broadcast to frontend
         for k, fv in feeds.items():
             state._feed_buffer[k] = fv

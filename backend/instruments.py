@@ -33,6 +33,17 @@ def mcx_key(sym: str, months_ahead: int = 0) -> str:
     d = date.today() + timedelta(days=30 * months_ahead)
     return f"MCX_FO|{sym.upper()}{str(d.year)[2:]}{_M[d.month-1]}FUT"
 
+
+def mcx_key_for_month(sym: str, year: int, month: int) -> str:
+    """Resolve MCX futures instrument_key for an explicit year/month.
+    Used by the rollover step once the current-month options have expired.
+    Returns a numeric key from the instrument master when available, else a
+    name-based fallback (caller should treat that as invalid)."""
+    trading_sym = f"{sym.upper()}{str(year)[2:]}{_M[month - 1]}FUT"
+    if _mcx_sym_to_key and trading_sym in _mcx_sym_to_key:
+        return _mcx_sym_to_key[trading_sym]
+    return f"MCX_FO|{trading_sym}"
+
 INDEX_SPOT = {
     "NIFTY":      "NSE_INDEX|Nifty 50",
     "BANKNIFTY":  "NSE_INDEX|Nifty Bank",
@@ -874,12 +885,19 @@ def get_current_and_next_expiry(expiries: list, symbol: str) -> dict:
     future = sorted([e for e in expiries if e >= today.isoformat()])
     result = {"all": expiries, "default": future[0] if future else None}
     if symbol.upper() in MONTHLY_SYMBOLS:
-        this_m = today.strftime("%Y-%m")
-        next_m = (today.replace(day=28)+timedelta(days=4)).strftime("%Y-%m")
-        cm = [e for e in future if e.startswith(this_m)]
-        nm = [e for e in future if e.startswith(next_m)]
-        result["current_month"] = cm[-1] if cm else None
-        result["next_month"]    = nm[-1] if nm else None
+        # Group unexpired expiries by year-month in order. The first live
+        # month is "current_month" and the second is "next_month". Once the
+        # calendar month's options have all expired this naturally rolls the
+        # labels forward — e.g. on 17 Apr after Crude's 16 Apr options die,
+        # current_month = 14 May and next_month = June expiry.
+        months_order = []
+        for e in future:
+            ym = e[:7]
+            if ym not in months_order:
+                months_order.append(ym)
+        def _last_in(ym): return [e for e in future if e.startswith(ym)][-1]
+        result["current_month"] = _last_in(months_order[0]) if len(months_order) > 0 else None
+        result["next_month"]    = _last_in(months_order[1]) if len(months_order) > 1 else None
     else:
         result["current_week"] = future[0] if len(future)>0 else None
         result["next_week"]    = future[1] if len(future)>1 else None
