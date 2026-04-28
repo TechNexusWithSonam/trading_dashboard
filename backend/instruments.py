@@ -197,37 +197,53 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
     # MCX options are listed under the futures contract of the same month.
     # When the requested expiry belongs to a later month than the current
     # spot futures, resolve the underlying to that month's futures key so
-    # /v2/option/contract returns the right strikes.
-    option_key = _mcx_underlying_for_expiry(symbol, expiry) or \
-                 _mcx_option_underlying.get(symbol.upper(), spot_key)
+    # /v2/option/contract returns the right strikes. For commodities like
+    # GOLD where futures trade bi-monthly but options for a given expiry
+    # may be listed under a different month's futures, we fall back to
+    # iterating every futures key for the symbol until one returns
+    # contracts for the requested expiry.
+    sym_upper = symbol.upper()
+    primary  = _mcx_underlying_for_expiry(symbol, expiry)
+    canonical = _mcx_option_underlying.get(sym_upper, spot_key)
+    underlyings = []
+    for k in (primary, canonical, spot_key):
+        if k and k not in underlyings: underlyings.append(k)
+    # Then every futures key the instrument master knows for this symbol
+    # (skipping mini/micro variants) — covers cases where 2026-09-25 GOLD
+    # options are listed under e.g. October futures rather than September.
+    for tsym, ikey in _mcx_sym_to_key.items():
+        if not (tsym.startswith(sym_upper) and tsym.endswith("FUT")): continue
+        suffix = tsym[len(sym_upper):]
+        if suffix[0:1] == "M" and suffix[1:2].isdigit(): continue  # mini
+        if any(v in tsym for v in ["PETAL", "GUINEA", "TEN", "MIC"]): continue
+        if ikey not in underlyings: underlyings.append(ikey)
+
+    option_key = underlyings[0] if underlyings else spot_key
+    filtered = []
 
     try:
         async with httpx.AsyncClient(timeout=20) as c:
-            # Step 1: Get contracts for this expiry
-            r = await c.get(UPSTOX_CONTRACTS,
-                            params={"instrument_key": option_key},
-                            headers=_h(token))
-            if r.status_code != 200:
-                print(f"[MCXChain] {symbol} contracts HTTP {r.status_code}")
-                return {}
-
-            contracts = r.json().get("data", [])
-            filtered = [ct for ct in contracts
-                        if isinstance(ct, dict) and ct.get("expiry") == expiry]
+            for idx, ikey in enumerate(underlyings[:6]):
+                # Step 1: Get contracts for this expiry from each candidate
+                r = await c.get(UPSTOX_CONTRACTS,
+                                params={"instrument_key": ikey},
+                                headers=_h(token))
+                if r.status_code != 200:
+                    if idx == 0:
+                        print(f"[MCXChain] {symbol} contracts HTTP {r.status_code}")
+                    if r.status_code == 429:
+                        await asyncio.sleep(0.8)
+                    continue
+                contracts = r.json().get("data", [])
+                filtered = [ct for ct in contracts
+                            if isinstance(ct, dict) and ct.get("expiry") == expiry]
+                if filtered:
+                    option_key = ikey
+                    break
+                await asyncio.sleep(0.15)
             if not filtered:
-                # Fallback: if the month-matched underlying returned nothing,
-                # try the canonical option underlying key as well.
-                canonical = _mcx_option_underlying.get(symbol.upper(), spot_key)
-                if canonical and canonical != option_key:
-                    r2 = await c.get(UPSTOX_CONTRACTS,
-                                     params={"instrument_key": canonical},
-                                     headers=_h(token))
-                    if r2.status_code == 200:
-                        filtered = [ct for ct in r2.json().get("data", [])
-                                    if isinstance(ct, dict) and ct.get("expiry") == expiry]
-                if not filtered:
-                    print(f"[MCXChain] {symbol}/{expiry} no contracts (underlying={option_key})")
-                    return {}
+                print(f"[MCXChain] {symbol}/{expiry} no contracts after trying {len(underlyings[:6])} underlyings")
+                return {}
 
             # Step 2: Group by strike
             strike_map = {}  # strike → {CE: key, PE: key}
