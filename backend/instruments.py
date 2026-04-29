@@ -258,9 +258,15 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                 print(f"[MCXChain] {symbol}/{expiry} no strikes")
                 return {}
 
-            # Step 3: Get spot price from futures quote
+            # Step 3: Get spot price from the resolved option underlying.
+            # `option_key` is the futures contract that actually carries
+            # this expiry's options — for monthly contracts (CRUDEOIL,
+            # NATURALGAS) it equals the same-month spot; for bi-monthly
+            # contracts (GOLD/SILVER/COPPER) the Aug+Sep options both
+            # live on Oct futures, so `option_key` is the correct
+            # underlying even though it differs from the global spot_key.
             r2 = await c.get(UPSTOX_QUOTE_V2,
-                             params={"instrument_key": spot_key},
+                             params={"instrument_key": option_key},
                              headers=_h(token))
             spot_from_quote = 0.0
             if r2.status_code == 200:
@@ -368,6 +374,12 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                         "key":   pe_key,
                     },
                     "_spot": spot_from_quote,
+                    # Surface the resolved underlying futures key so
+                    # downstream consumers (calculator.py) can pair this
+                    # expiry's options with the right spot — necessary
+                    # for bi-monthly MCX symbols where same-month
+                    # futures don't exist (GOLD Sep options → Oct futures).
+                    "_option_key": option_key,
                 }
 
             if chain:

@@ -48,6 +48,7 @@ from .instruments import (
 )
 from . import instruments as _instruments_mod
 from . import instrument_keys as _ik
+from . import calculator as calc_mod
 from .instrument_keys import NSE_EQ_KEYS
 from .loc_engine import LOCEngine, calc_loc_25
 
@@ -335,6 +336,11 @@ class AppState:
     frame_count: int = 0
     decode_ok:   int = 0
     subscribed_option_keys: set = set()
+    # Spot-side MCX futures keys subscribed on demand by the calculator
+    # endpoint (one per month per symbol). Tracked separately from
+    # subscribed_option_keys so the LOC/option subscription logic stays
+    # untouched.
+    subscribed_calc_spot_keys: set = set()
     feed_log: list = []  # recent feed debug messages
     _feed_buffer: dict = {}       # buffered feeds for throttled broadcast
     _feed_buffer_lock = None      # asyncio.Lock, created at startup
@@ -1407,68 +1413,12 @@ async def set_expiry(symbol: str, payload: dict):
 
 
 # ── Dedicated Calculator endpoint ─────────────────────────────────────
-# Decoupled from the calc_state / calc_results WebSocket pipeline so the
-# Calculator filter is a simple request/response: frontend POSTs a symbol+
-# expiry, backend fetches a fresh option chain, computes the 25 LOC
-# formulas using the live spot price, and returns the result. Frontend
-# polls every 5 s while a non-default expiry is selected.
-_calc_chain_cache: dict = {}   # (sym, expiry) -> (ts, chain) — 60 s TTL
-_calc_chain_inflight: dict = {}  # (sym, expiry) -> asyncio.Event (dedup)
-
-async def _fetch_chain_for_calculator(sym: str, expiry: str) -> dict:
-    """Fetch option chain with progressive 429 backoff and aggressive
-    caching. The backend's own periodic_refresh + ATM-shift force chain
-    refreshes can put the Upstox token in a 30-60 s rate-limit lockout;
-    this helper keeps trying across that window so the user click doesn't
-    return a 502.
-
-    - Cache TTL 60 s: with the frontend polling every 5 s, only every
-      ~12th poll attempts a real Upstox fetch.
-    - Inflight dedup: if a fetch is already running for the same key,
-      concurrent callers wait on the same event instead of stacking
-      additional requests.
-    - 5-attempt backoff (0/2/5/10/18 s, ~35 s total): rides out a
-      moderate Upstox 429 window before giving up.
-    """
-    key = (sym, expiry)
-    cached = _calc_chain_cache.get(key)
-    if cached and (time.time() - cached[0]) < 60:
-        return cached[1]
-
-    inflight = _calc_chain_inflight.get(key)
-    if inflight is not None:
-        # Another request is already fetching this chain — wait for it
-        # rather than firing another Upstox call.
-        try:
-            await asyncio.wait_for(inflight.wait(), timeout=40)
-        except asyncio.TimeoutError:
-            pass
-        cached = _calc_chain_cache.get(key)
-        if cached and (time.time() - cached[0]) < 60:
-            return cached[1]
-        return {}
-
-    event = asyncio.Event()
-    _calc_chain_inflight[key] = event
-    try:
-        backoffs = [0, 2, 5, 10, 18]   # 5 attempts, ~35 s total window
-        chain = {}
-        for delay in backoffs:
-            if delay:
-                await asyncio.sleep(delay)
-            try:
-                chain = await fetch_option_chain(sym, expiry, state.access_token)
-            except Exception as e:
-                print(f"[CalcChain] {sym}/{expiry} fetch error: {e}")
-                chain = {}
-            if chain:
-                break
-        if chain:
-            _calc_chain_cache[key] = (time.time(), chain)
-        return chain or {}
-    finally:
-        event.set()
-        _calc_chain_inflight.pop(key, None)
+# Frontend posts symbol+expiry; backend returns the 25 LOC formulas
+# computed against a fresh chain for that expiry. Frontend polls every
+# 5 s while a non-default expiry is selected. The actual chain fetch,
+# spot-key resolution, WS subscribe, and LOC compute now live in
+# backend/calculator.py — keeps that pipeline isolated from the live
+# LOC table and from MCX/index rollover state.
 
 @app.get("/api/calculator/{symbol}")
 async def get_calculator(symbol: str, expiry: str = ""):
@@ -1505,79 +1455,22 @@ async def get_calculator(symbol: str, expiry: str = ""):
         if st and st.loc_result:
             return {**st.loc_result, "expiry": expiry, "source": "loc"}
 
-    # Non-default: fetch fresh chain (cached 30 s)
-    chain = await _fetch_chain_for_calculator(sym, expiry)
-    if not chain:
-        raise HTTPException(502, f"option chain unavailable for {sym}/{expiry}")
-
-    st = loc_engine.get_state(sym)
-    if not st:
-        raise HTTPException(404, f"unknown symbol {sym}")
-
-    # Spot LTP: prefer live WS, fall back to chain's underlying_spot_price
-    spot_ltp = st.spot.ltp
-    if not spot_ltp:
-        for row in chain.values():
-            sp = row.get("_spot", 0)
-            if sp:
-                spot_ltp = float(sp); break
-    if not spot_ltp:
-        raise HTTPException(503, f"no spot price for {sym}")
-
-    ce_strike, pe_strike = get_itm2_strikes(spot_ltp, sym)
-    step = STRIKE_STEPS.get(sym, 50)
-
-    def _pick(target):
-        if target in chain: return target, chain[target]
-        if not chain: return target, {}
-        nearest = min(chain.keys(), key=lambda k: abs(k - target))
-        if abs(nearest - target) <= step * 4:
-            return nearest, chain[nearest]
-        return target, {}
-
-    ce_actual, ce_row = _pick(ce_strike)
-    pe_actual, pe_row = _pick(pe_strike)
-    ce = (ce_row or {}).get("CE", {}) if ce_row else {}
-    pe = (pe_row or {}).get("PE", {}) if pe_row else {}
-
-    sp_close = st.spot.close or spot_ltp
-    sp_high  = st.spot.high  or spot_ltp
-    sp_low   = st.spot.low   or spot_ltp
-    sp_open  = st.spot.open  or spot_ltp
-
-    ce_ltp   = float(ce.get("ltp")   or 0)
-    ce_close = float(ce.get("close") or 0)
-    ce_high  = float(ce.get("high")  or 0)
-    ce_low   = float(ce.get("low")   or 0)
-    pe_ltp   = float(pe.get("ltp")   or 0)
-    pe_close = float(pe.get("close") or 0)
-    pe_high  = float(pe.get("high")  or 0)
-    pe_low   = float(pe.get("low")   or 0)
-
-    res = calc_loc_25(
-        spot_ltp, sp_close, sp_high, sp_low, sp_open,
-        ce_ltp, ce_close, ce_high, ce_low,
-        pe_ltp, pe_close, pe_high, pe_low,
+    # Non-default: delegate to the isolated calculator module. It pairs
+    # the requested options expiry with the matching-month spot (futures
+    # for MCX, unchanged spot for indices/stocks) and ensures that
+    # spot key is on the live WS feed.
+    res = await calc_mod.compute_calc_result(
+        sym=sym, expiry=expiry,
+        default_spot_keys=SPOT_KEYS_D,
+        market_data=state.market_data,
+        prev_close=state.prev_close,
+        access_token=state.access_token,
+        upstox_ws=state.upstox_ws,
+        sub_binary=_sub_binary,
+        subscribed_set=state.subscribed_calc_spot_keys,
     )
-    res.update({
-        "symbol":    sym,
-        "expiry":    expiry,
-        "spot_high": round(sp_high, 2),
-        "spot_low":  round(sp_low, 2),
-        "ce_strike": ce_actual,
-        "pe_strike": pe_actual,
-        "ce_ltp":    round(ce_ltp,   2),
-        "pe_ltp":    round(pe_ltp,   2),
-        "ce_close":  round(ce_close, 2),
-        "pe_close":  round(pe_close, 2),
-        "ce_high":   round(ce_high,  2),
-        "ce_low":    round(ce_low,   2),
-        "pe_high":   round(pe_high,  2),
-        "pe_low":    round(pe_low,   2),
-        "ce_iv":     round(float(ce.get("iv") or 0), 2),
-        "pe_iv":     round(float(pe.get("iv") or 0), 2),
-        "source":    "calculator",
-    })
+    if res is None:
+        raise HTTPException(502, f"option chain unavailable for {sym}/{expiry}")
     return res
 
 @app.get("/api/ohlc/{key:path}")
