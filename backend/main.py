@@ -1236,7 +1236,7 @@ async def start_feed():
         try:
             async with _ws_connect(FEED_URL, headers) as ws:
                 state.upstox_ws = ws
-                print("[Feed] ✓ Connected to Upstox V3 WebSocket")
+                print("[Feed] Connected to Upstox V3 WebSocket")
 
                 # 1. Indices — full mode
                 await _sub_binary(ws, INDEX_KEYS, "full")
