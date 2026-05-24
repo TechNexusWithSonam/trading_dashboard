@@ -388,7 +388,8 @@ def _record_loc_hist(sym, loc):
     if state.loc_hist_ts.get(sym) == now: return
     state.loc_hist_ts[sym] = now
     hist = state.loc_history.setdefault(sym, [])
-    keep = ["ltp","bop","cep","pep","ul","ll","zone","change","direction",
+    keep = ["ltp","bop","cep","pep","ul","ll","ful","fll","ful_diff","fll_diff",
+            "zone","change","direction",
             "ce_strike","pe_strike","ce_ltp","pe_ltp","ce_iv","pe_iv"]
     hist.insert(0, {"ts":int(time.time()*1000), **{k:loc[k] for k in keep if k in loc}})
     if len(hist) > 60: hist.pop()
