@@ -218,12 +218,28 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
         if any(v in tsym for v in ["PETAL", "GUINEA", "TEN", "MIC"]): continue
         if ikey not in underlyings: underlyings.append(ikey)
 
+    # Add name-based fallback keys for the expiry month + next 2 months.
+    # NaturalGas June options live under July futures; July options under Aug
+    # futures, etc. The next month's futures may not be in the instrument
+    # master yet (CSV updated ~45 days ahead), so we generate name-based keys
+    # that Upstox accepts directly. This ensures we always try the right month.
+    try:
+        exp_yr = int(expiry[:4]); exp_mo = int(expiry[5:7])
+        for delta in range(0, 3):
+            m = (exp_mo - 1 + delta) % 12 + 1
+            y = exp_yr + ((exp_mo - 1 + delta) // 12)
+            name_key = f"MCX_FO|{sym_upper}{str(y)[2:]}{_M[m - 1]}FUT"
+            if name_key not in underlyings:
+                underlyings.append(name_key)
+    except Exception:
+        pass
+
     option_key = underlyings[0] if underlyings else spot_key
     filtered = []
 
     try:
         async with httpx.AsyncClient(timeout=20) as c:
-            for idx, ikey in enumerate(underlyings[:6]):
+            for idx, ikey in enumerate(underlyings[:10]):
                 # Step 1: Get contracts for this expiry from each candidate
                 r = await c.get(UPSTOX_CONTRACTS,
                                 params={"instrument_key": ikey},
@@ -242,7 +258,7 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                     break
                 await asyncio.sleep(0.15)
             if not filtered:
-                print(f"[MCXChain] {symbol}/{expiry} no contracts after trying {len(underlyings[:6])} underlyings")
+                print(f"[MCXChain] {symbol}/{expiry} no contracts after trying {len(underlyings[:10])} underlyings")
                 return {}
 
             # Step 2: Group by strike
