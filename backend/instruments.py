@@ -236,8 +236,12 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
 
     option_key = underlyings[0] if underlyings else spot_key
     filtered = []
+    fallback_filtered: list = []
+    fallback_expiry: str = ""
+    fallback_key: str = ""
 
     try:
+        today_str = date.today().isoformat()
         async with httpx.AsyncClient(timeout=20) as c:
             for idx, ikey in enumerate(underlyings[:10]):
                 # Step 1: Get contracts for this expiry from each candidate
@@ -251,16 +255,36 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                     continue
                 contracts = r.json().get("data", [])
                 all_expiries = sorted(set(ct.get("expiry","") for ct in contracts if isinstance(ct,dict) and ct.get("expiry")))
-                filtered = [ct for ct in contracts
-                            if isinstance(ct, dict) and ct.get("expiry") == expiry]
-                print(f"[MCXChain] {symbol} underlying[{idx}]={ikey}: {len(contracts)} contracts, expiries={all_expiries[:5]}, matched={len(filtered)}")
-                if filtered:
+                matched = [ct for ct in contracts
+                           if isinstance(ct, dict) and ct.get("expiry") == expiry]
+                print(f"[MCXChain] {symbol} underlying[{idx}]={ikey}: {len(contracts)} contracts, expiries={all_expiries[:5]}, matched={len(matched)}")
+                if matched:
+                    filtered = matched
                     option_key = ikey
                     break
+                # Track nearest available future expiry as fallback.
+                # Handles MCX date mismatches (e.g. expiry API says 2026-06-25
+                # but contracts actually show 2026-06-23 on the JUNFUT).
+                future_expiries = [e for e in all_expiries if e >= today_str]
+                if future_expiries:
+                    nearest = min(future_expiries,
+                                  key=lambda e: abs((date.fromisoformat(e) - date.fromisoformat(expiry)).days))
+                    nearest_cts = [ct for ct in contracts if isinstance(ct,dict) and ct.get("expiry") == nearest]
+                    if nearest_cts and (not fallback_expiry or
+                            abs((date.fromisoformat(nearest) - date.fromisoformat(expiry)).days) <
+                            abs((date.fromisoformat(fallback_expiry) - date.fromisoformat(expiry)).days)):
+                        fallback_filtered = nearest_cts
+                        fallback_expiry   = nearest
+                        fallback_key      = ikey
                 await asyncio.sleep(0.15)
             if not filtered:
-                print(f"[MCXChain] {symbol}/{expiry} no contracts after trying {len(underlyings[:10])} underlyings")
-                return {}
+                if fallback_filtered:
+                    filtered   = fallback_filtered
+                    option_key = fallback_key
+                    print(f"[MCXChain] {symbol} expiry mismatch — requested {expiry}, using nearest {fallback_expiry}")
+                else:
+                    print(f"[MCXChain] {symbol}/{expiry} no contracts after trying {len(underlyings[:10])} underlyings")
+                    return {}
 
             # Step 2: Group by strike
             strike_map = {}  # strike → {CE: key, PE: key}
