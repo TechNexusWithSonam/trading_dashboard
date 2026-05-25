@@ -307,11 +307,12 @@ class LOCEngine:
         ce_row = st.option_chain.get(st.ce_strike, {})
         pe_row = st.option_chain.get(st.pe_strike, {})
 
+        strikes = sorted(st.option_chain.keys())
+        step = STRIKE_STEPS.get(symbol.upper(), 50)
+
         if not ce_row or not pe_row:
             # Strikes not in chain — find nearest available strikes
-            step = STRIKE_STEPS.get(symbol.upper(), 50)
             tolerance = step * 4
-            strikes = sorted(st.option_chain.keys())
             if strikes:
                 nearest_ce = min(strikes, key=lambda s: abs(s - st.ce_strike))
                 nearest_pe = min(strikes, key=lambda s: abs(s - st.pe_strike))
@@ -321,6 +322,26 @@ class LOCEngine:
                 if abs(nearest_pe - st.pe_strike) < tolerance:
                     pe_row = st.option_chain.get(nearest_pe, {})
                     if pe_row: st.pe_strike = nearest_pe
+
+        # MCX options are illiquid at ITM-2 — fall back to nearest strike
+        # with non-zero LTP so the LOC engine has real data to work with.
+        if strikes:
+            ce_ltp = float((ce_row.get("CE") or {}).get("ltp", 0) or 0)
+            if ce_ltp == 0:
+                for s in sorted(strikes, key=lambda x: abs(x - st.ce_strike)):
+                    row = st.option_chain.get(s, {})
+                    if float((row.get("CE") or {}).get("ltp", 0) or 0) > 0:
+                        ce_row = row
+                        st.ce_strike = s
+                        break
+            pe_ltp = float((pe_row.get("PE") or {}).get("ltp", 0) or 0)
+            if pe_ltp == 0:
+                for s in sorted(strikes, key=lambda x: abs(x - st.pe_strike)):
+                    row = st.option_chain.get(s, {})
+                    if float((row.get("PE") or {}).get("ltp", 0) or 0) > 0:
+                        pe_row = row
+                        st.pe_strike = s
+                        break
 
         def _best(*vals):
             for v in vals:
