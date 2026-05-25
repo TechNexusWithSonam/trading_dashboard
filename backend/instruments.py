@@ -276,6 +276,10 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                         fallback_filtered = nearest_cts
                         fallback_expiry   = nearest
                         fallback_key      = ikey
+                        # Close enough (≤7 days off) — stop searching to avoid
+                        # extra API calls that cause 429s for other symbols.
+                        if abs((date.fromisoformat(nearest) - date.fromisoformat(expiry)).days) <= 7:
+                            break
                 await asyncio.sleep(0.15)
             if not filtered:
                 if fallback_filtered:
