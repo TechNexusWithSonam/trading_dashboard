@@ -407,9 +407,15 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
 
             if chain:
                 atm_s = min(chain.keys(), key=lambda s: abs(s - (spot_from_quote or ce_target)))
+                atm_ce_ltp = chain[atm_s]['CE']['ltp']
                 print(f"[MCXChain] {symbol}/{expiry}: {len(chain)} strikes, "
                       f"spot={spot_from_quote}, ATM={atm_s}, "
-                      f"CE_ltp={chain[atm_s]['CE']['ltp']}")
+                      f"CE_ltp={atm_ce_ltp}")
+                if atm_ce_ltp == 0 and quotes:
+                    sample = list(quotes.keys())[:4]
+                    print(f"[MCXChain] DEBUG {symbol} quotes keys sample: {sample}")
+                elif atm_ce_ltp == 0:
+                    print(f"[MCXChain] DEBUG {symbol} quotes dict is EMPTY — API returned no data")
             return chain
 
     except Exception as e:
