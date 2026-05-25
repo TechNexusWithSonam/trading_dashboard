@@ -956,7 +956,12 @@ def get_current_and_next_expiry(expiries: list, symbol: str) -> dict:
         result["current_month"] = _last_in(months_order[0]) if len(months_order) > 0 else None
         result["next_month"]    = _last_in(months_order[1]) if len(months_order) > 1 else None
     else:
-        result["current_week"] = future[0] if len(future)>0 else None
-        result["next_week"]    = future[1] if len(future)>1 else None
-        result["far_week"]     = future[2] if len(future)>2 else None
+        # Skip expiries within 3 days — near-expiry MCX contracts are
+        # often delisted or illiquid before their last day.
+        near_cutoff = (today + timedelta(days=3)).isoformat()
+        active = [e for e in future if e > near_cutoff] or future
+        result["default"]      = active[0] if active else result["default"]
+        result["current_week"] = active[0] if len(active)>0 else None
+        result["next_week"]    = active[1] if len(active)>1 else None
+        result["far_week"]     = active[2] if len(active)>2 else None
     return result
