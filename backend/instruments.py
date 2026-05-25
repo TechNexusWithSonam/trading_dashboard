@@ -258,6 +258,17 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                 print(f"[MCXChain] {symbol}/{expiry} no strikes")
                 return {}
 
+            # Build contract-level numeric→tradingsym mapping for quote parsing.
+            # _mcx_numeric_to_name only covers futures; option keys need this fallback.
+            key_to_tsym = {}
+            for ct in filtered:
+                ikey = ct.get("instrument_key", "")
+                tsym = ct.get("trading_symbol", "")
+                if ikey and tsym:
+                    key_to_tsym[ikey] = tsym
+                    if ikey not in _mcx_numeric_to_name:
+                        _mcx_numeric_to_name[ikey] = f"MCX_FO|{tsym}"
+
             # Step 3: Get spot price from the resolved option underlying.
             # `option_key` is the futures contract that actually carries
             # this expiry's options — for monthly contracts (CRUDEOIL,
@@ -265,15 +276,21 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
             # contracts (GOLD/SILVER/COPPER) the Aug+Sep options both
             # live on Oct futures, so `option_key` is the correct
             # underlying even though it differs from the global spot_key.
-            r2 = await c.get(UPSTOX_QUOTE_V2,
-                             params={"instrument_key": option_key},
-                             headers=_h(token))
             spot_from_quote = 0.0
-            if r2.status_code == 200:
-                for _, v in (r2.json().get("data", {}) or {}).items():
-                    if v:
-                        spot_from_quote = float(v.get("last_price", 0))
-                        break
+            for attempt in range(2):
+                r2 = await c.get(UPSTOX_QUOTE_V2,
+                                 params={"instrument_key": option_key},
+                                 headers=_h(token))
+                if r2.status_code == 200:
+                    for _, v in (r2.json().get("data", {}) or {}).items():
+                        if v:
+                            spot_from_quote = float(v.get("last_price", 0))
+                            break
+                    break
+                elif r2.status_code == 429 and attempt == 0:
+                    await asyncio.sleep(1.5)
+                else:
+                    break
 
             # Step 4: Find ITM-2 strikes and nearby strikes, fetch their quotes
             step = STRIKE_STEPS.get(symbol.upper(), 50)
@@ -317,9 +334,15 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                         for rk, rv in resp_data.items():
                             if rv:
                                 quotes[rk.replace(":", "|", 1)] = rv
-                        # Map requested numeric keys -> name-based response keys
+                        # Map requested numeric keys -> name-based response keys.
+                        # Prefer _mcx_numeric_to_name; fall back to key_to_tsym
+                        # built from contracts (covers option keys not in master).
                         for req_key in chunk:
                             name_key = _mcx_numeric_to_name.get(req_key, "")
+                            if not name_key:
+                                tsym = key_to_tsym.get(req_key, "")
+                                if tsym:
+                                    name_key = f"MCX_FO|{tsym}"
                             if name_key:
                                 colon_name = name_key.replace("|", ":", 1)
                                 val = resp_data.get(colon_name)
