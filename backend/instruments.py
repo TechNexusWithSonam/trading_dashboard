@@ -245,14 +245,15 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                                 params={"instrument_key": ikey},
                                 headers=_h(token))
                 if r.status_code != 200:
-                    if idx == 0:
-                        print(f"[MCXChain] {symbol} contracts HTTP {r.status_code}")
+                    print(f"[MCXChain] {symbol} underlying[{idx}]={ikey} HTTP {r.status_code}")
                     if r.status_code == 429:
                         await asyncio.sleep(0.8)
                     continue
                 contracts = r.json().get("data", [])
+                all_expiries = sorted(set(ct.get("expiry","") for ct in contracts if isinstance(ct,dict) and ct.get("expiry")))
                 filtered = [ct for ct in contracts
                             if isinstance(ct, dict) and ct.get("expiry") == expiry]
+                print(f"[MCXChain] {symbol} underlying[{idx}]={ikey}: {len(contracts)} contracts, expiries={all_expiries[:5]}, matched={len(filtered)}")
                 if filtered:
                     option_key = ikey
                     break
