@@ -453,9 +453,12 @@ class LOCEngine:
             st.pe.effective_high, st.pe.effective_low,
         )
         res.update({
-            "symbol":symbol,
-            "spot_high": round(st.spot.high or spot_ltp, 2),
-            "spot_low":  round(st.spot.low  or spot_ltp, 2),
+            "symbol":     symbol,
+            "spot_ltp":   round(spot_ltp, 2),
+            "spot_close": round(st.spot.close or spot_ltp, 2),
+            "spot_high":  round(st.spot.high  or spot_ltp, 2),
+            "spot_low":   round(st.spot.low   or spot_ltp, 2),
+            "spot_open":  round(st.spot.open  or spot_ltp, 2),
             "ce_strike": st.ce_strike,
             "pe_strike": st.pe_strike,
             "expiry":    st.expiry,
