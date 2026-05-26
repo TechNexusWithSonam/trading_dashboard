@@ -5,8 +5,9 @@
 *.pyd
 .Python
 *.egg-info/
-dist/
-build/
+/dist/
+/build/
+!frontend/dist/
 .eggs/
 
 # Virtual environments
