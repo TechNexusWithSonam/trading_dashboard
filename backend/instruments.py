@@ -276,9 +276,14 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                         fallback_filtered = nearest_cts
                         fallback_expiry   = nearest
                         fallback_key      = ikey
-                        # Close enough (≤7 days off) — stop searching to avoid
-                        # extra API calls that cause 429s for other symbols.
-                        if abs((date.fromisoformat(nearest) - date.fromisoformat(expiry)).days) <= 7:
+                        # Close enough — stop searching early to save API calls.
+                        # ≤7 days: small date mismatch (NaturalGas / Crude).
+                        # ≤45 days: GOLD/SILVER/COPPER delivery-month convention —
+                        # expiry list returns last day of delivery month (e.g.
+                        # 2026-08-31) but option contracts expire early that month
+                        # (~Aug 4). The gap can be 25-30 days; 45 covers it safely.
+                        gap = abs((date.fromisoformat(nearest) - date.fromisoformat(expiry)).days)
+                        if gap <= 45:
                             break
                 await asyncio.sleep(0.15)
             if not filtered:
@@ -488,14 +493,35 @@ async def fetch_option_chain(symbol: str, expiry: str, token: str) -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get(UPSTOX_CHAIN,
-                            params={"instrument_key": spot_key, "expiry_date": expiry},
-                            headers=_h(token))
-            print(f"[Chain] {symbol}/{expiry} HTTP {r.status_code}")
-            if r.status_code != 200:
-                print(f"[Chain] error: {r.text[:200]}"); return {}
-            rows = r.json().get("data", [])
-            if not rows: print(f"[Chain] {symbol} empty"); return {}
+            # Try ISIN-based key first, then NSE_FO symbol-based fallback.
+            # Some stocks' option chains return empty on ISIN key but work on
+            # the trading-symbol key (e.g. recently-added F&O names).
+            keys_to_try = [spot_key]
+            if spot_key.startswith("NSE_EQ|"):
+                keys_to_try.append(f"NSE_FO|{symbol.upper()}")
+
+            rows = []
+            for attempt_key in keys_to_try:
+                for attempt in range(2):  # retry once on 429
+                    r = await c.get(UPSTOX_CHAIN,
+                                    params={"instrument_key": attempt_key, "expiry_date": expiry},
+                                    headers=_h(token))
+                    print(f"[Chain] {symbol}/{expiry} key={attempt_key} HTTP {r.status_code}")
+                    if r.status_code == 429:
+                        print(f"[Chain] {symbol} rate-limited, retry in 1.5s")
+                        await asyncio.sleep(1.5)
+                        continue
+                    if r.status_code != 200:
+                        print(f"[Chain] error: {r.text[:200]}")
+                        break
+                    rows = r.json().get("data", []) or []
+                    if rows:
+                        break
+                if rows:
+                    break
+            if not rows:
+                print(f"[Chain] {symbol}/{expiry} empty after all attempts")
+                return {}
 
             chain = {}
             spot_from_chain = 0.0  # Upstox returns underlying_spot_price
