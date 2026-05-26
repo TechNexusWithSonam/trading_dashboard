@@ -120,13 +120,26 @@ async def fetch_expiry_list(symbol: str, token: str) -> list:
         opt_key = _mcx_option_underlying.get(sym_upper)
         if opt_key and opt_key not in [k for _, k in keys_to_try]:
             keys_to_try.append(("OPT_UNDERLYING", opt_key))
+        # Prepend the currently-active validated spot key so it's always
+        # queried even if it sits beyond the slice limit below. After a
+        # monthly rollover the new futures key may be far down the sorted
+        # master list; without this it gets cut off and we miss its expiries.
+        active_spot = _validated_mcx.get(sym_upper) or spot_key
+        existing_keys = [k for _, k in keys_to_try]
+        if active_spot not in existing_keys:
+            keys_to_try.insert(0, ("ACTIVE_SPOT", active_spot))
+        elif active_spot in existing_keys:
+            # Move it to front so it's never cut by the slice
+            idx = existing_keys.index(active_spot)
+            entry = keys_to_try.pop(idx)
+            keys_to_try.insert(0, entry)
         # Fallback to spot key
         if not keys_to_try:
             keys_to_try.append(("SPOT", spot_key))
 
         try:
             async with httpx.AsyncClient(timeout=15) as c:
-                for tsym, ikey in keys_to_try[:4]:  # limit to 4 nearest futures
+                for tsym, ikey in keys_to_try[:6]:  # try up to 6 futures keys
                     r = await c.get(UPSTOX_CONTRACTS,
                                     params={"instrument_key": ikey},
                                     headers=_h(token))
@@ -1029,15 +1042,17 @@ def get_current_and_next_expiry(expiries: list, symbol: str) -> dict:
     result = {"all": expiries, "default": future[0] if future else None}
 
     if symbol.upper() in MONTHLY_SYMBOLS:
-        # Group by calendar-month. First live month = current_month, second = next_month.
-        # On expiry day itself, today's expiry IS still in `future` so current_month
-        # correctly reflects the live month. After it passes, months_order shifts.
+        # For monthly MCX contracts, use `active` (strictly after today) so that
+        # on expiry day itself the system rolls to the next month. MCX monthly
+        # options expire mid-session; keeping today's expiry as `current_month`
+        # all day would mean trading on a contract that's already closed.
+        ref = active if active else future
         months_order = []
-        for e in future:
+        for e in ref:
             ym = e[:7]
             if ym not in months_order:
                 months_order.append(ym)
-        def _last_in(ym): return [e for e in future if e.startswith(ym)][-1]
+        def _last_in(ym): return [e for e in ref if e.startswith(ym)][-1]
         result["current_month"] = _last_in(months_order[0]) if len(months_order) > 0 else None
         result["next_month"]    = _last_in(months_order[1]) if len(months_order) > 1 else None
         # default = current_month (the live monthly contract), consistent with label.

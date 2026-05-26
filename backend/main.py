@@ -529,9 +529,28 @@ async def startup_init():
     # 16 Apr. Now that expiries are known, point the spot at whichever
     # month's options are actually live (info["default"]).
     global _last_rollover_check_date
-    _align_mcx_spot_to_options()
+    rolled_init = _align_mcx_spot_to_options()
     from datetime import date as _dc_init
     _last_rollover_check_date = _dc_init.today()
+
+    # Re-fetch expiry list for any MCX symbols whose spot key rolled to a new
+    # month. The initial fetch_expiry_list used the old spot key; the new
+    # contract (e.g. GOLD August futures) has different available expiries
+    # (e.g. June 30, July 29) that replace the stale default from the old key.
+    if rolled_init and state.access_token:
+        rolled_syms = {sym for sym, *_ in rolled_init}
+        for sym in rolled_syms:
+            try:
+                expiries = await fetch_expiry_list(sym, state.access_token)
+                info = get_current_and_next_expiry(expiries, sym)
+                state.expiry_cache[sym] = info
+                default = info.get("default")
+                if default:
+                    loc_engine.set_expiry(sym, default, fetch_chain=False)
+                    print(f"[Init] {sym} post-rollover expiry re-fetched: default={default}")
+            except Exception as e:
+                print(f"[Init] {sym} post-rollover expiry re-fetch error: {e}")
+
     # Prime spot OHLC (open/high/low/close) for the rolled-over MCX futures
     # via REST so the LOC engine's spot isn't stuck at `ltp` when WS ticks
     # haven't arrived (e.g. weekends, pre-open). Runs unconditionally — if
@@ -799,29 +818,34 @@ def _align_mcx_spot_to_options() -> list:
         print(f"[MCX Rollover] {sym}: {old_spot} → {new_spot} "
               f"(expiry={defx}, numeric={is_numeric})")
 
-    if rolled:
-        primary = []
-        for s in _MCX_LOC:
-            k = SPOT_KEYS_D.get(s, "")
-            if not k: continue
-            t = k.split("|", 1)[1] if "|" in k else ""
-            # Only numeric keys can receive WS ticks
-            if t and t[:1].isdigit():
-                primary.append(k)
-        next_mo = []
-        for s in _MCX_LOC:
-            nm = (state.expiry_cache.get(s) or {}).get("next_month") or ""
-            if len(nm) < 7: continue
-            try:
-                yr2 = int(nm[:4]); mo2 = int(nm[5:7])
-            except Exception:
-                continue
-            k2 = mcx_key_for_month(s, yr2, mo2)
-            t2 = k2.split("|", 1)[1] if "|" in k2 else ""
-            if t2 and t2[:1].isdigit():
-                next_mo.append(k2)
-        COMMODITY_KEYS = list(dict.fromkeys(primary + next_mo))
-        print(f"[MCX Rollover] COMMODITY_KEYS rebuilt: {COMMODITY_KEYS}")
+    # Always rebuild COMMODITY_KEYS so current spot keys are always subscribed
+    # even if nothing rolled (e.g. after a restart or expiry fetch update).
+    primary = []
+    for s in _MCX_LOC:
+        k = SPOT_KEYS_D.get(s, "")
+        if not k: continue
+        t = k.split("|", 1)[1] if "|" in k else ""
+        # Only numeric keys can receive WS ticks
+        if t and t[:1].isdigit():
+            primary.append(k)
+    next_mo = []
+    next_mo_map = {}  # key → "SYM/YYYY-MM" for diagnostics
+    for s in _MCX_LOC:
+        nm = (state.expiry_cache.get(s) or {}).get("next_month") or ""
+        if len(nm) < 7: continue
+        try:
+            yr2 = int(nm[:4]); mo2 = int(nm[5:7])
+        except Exception:
+            continue
+        k2 = mcx_key_for_month(s, yr2, mo2)
+        t2 = k2.split("|", 1)[1] if "|" in k2 else ""
+        if t2 and t2[:1].isdigit():
+            next_mo.append(k2)
+            next_mo_map[k2] = f"{s}/{nm[:7]}"
+    COMMODITY_KEYS = list(dict.fromkeys(primary + next_mo))
+    print(f"[MCX Align] primary={primary}")
+    print(f"[MCX Align] next_mo={next_mo_map}")
+    print(f"[MCX Align] COMMODITY_KEYS={COMMODITY_KEYS}")
     return rolled
 
 

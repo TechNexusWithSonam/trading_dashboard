@@ -246,13 +246,26 @@ class LOCEngine:
         opt = st.ce if opt_type=="CE" else st.pe
         if ltp and ltp>0:
             opt.ltp = ltp
+            # Intraday high/low: use WS-provided values (full marketFF ticks)
+            # when available; otherwise accumulate rolling max/min from ltp.
+            # Option WS ticks are often firstLevelWithGreeks which omits efeed
+            # high/low (sends 0), so without this accumulation ce_high == ce_ltp
+            # forever (a snapshot price, not a true session high).
+            if high > 0:
+                opt.high = high
+            elif opt.high > 0:
+                opt.high = max(opt.high, ltp)
+            else:
+                opt.high = ltp
+            if low > 0:
+                opt.low = low
+            elif opt.low > 0:
+                opt.low = min(opt.low, ltp)
+            else:
+                opt.low = ltp
         # Only seed close from WS if we have no close yet (REST hasn't arrived)
         if close and close>0 and not opt.close:
             opt.close = close
-        if high > 0:
-            opt.high = high
-        if low > 0:
-            opt.low = low
         self._recalc(symbol)
 
     def update_chain(self, symbol:str, chain:dict):
