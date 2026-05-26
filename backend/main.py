@@ -799,7 +799,12 @@ def _align_mcx_spot_to_options() -> list:
             continue
         if (yr, mo) == (today_d.year, today_d.month):
             continue  # default option is in the current calendar month
-        new_spot = mcx_key_for_month(sym, yr, mo)
+        # Use API-confirmed option underlying when available — it correctly maps
+        # options to their actual parent futures (e.g. SILVER Jun options live on
+        # Jul futures, so we must NOT roll spot to a non-existent Jun futures key).
+        # Fall back to month-based resolution only when underlying is unknown.
+        opt_underlying = _instruments_mod._mcx_option_underlying.get(sym) or ""
+        new_spot = opt_underlying if opt_underlying else mcx_key_for_month(sym, yr, mo)
         if not new_spot: continue
         old_spot = _instruments_mod._validated_mcx.get(sym) or SPOT_KEYS_D.get(sym)
         if old_spot == new_spot:
@@ -828,9 +833,18 @@ def _align_mcx_spot_to_options() -> list:
         # Only numeric keys can receive WS ticks
         if t and t[:1].isdigit():
             primary.append(k)
+    # Only pre-subscribe next-month futures for CrudeOil and NaturalGas —
+    # these expire every month so we need the upcoming contract subscribed
+    # a few days early. GOLD/SILVER/COPPER options live on the same futures
+    # as their current spot (confirmed via _mcx_option_underlying) so their
+    # next-month futures key is not needed in the WS feed and only creates
+    # "unknown key" noise in market data.
+    _next_mo_syms = {"CRUDEOIL", "NATURALGAS"}
     next_mo = []
     next_mo_map = {}  # key → "SYM/YYYY-MM" for diagnostics
     for s in _MCX_LOC:
+        if s not in _next_mo_syms:
+            continue
         nm = (state.expiry_cache.get(s) or {}).get("next_month") or ""
         if len(nm) < 7: continue
         try:

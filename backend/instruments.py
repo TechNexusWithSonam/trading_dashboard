@@ -1042,11 +1042,16 @@ def get_current_and_next_expiry(expiries: list, symbol: str) -> dict:
     result = {"all": expiries, "default": future[0] if future else None}
 
     if symbol.upper() in MONTHLY_SYMBOLS:
-        # For monthly MCX contracts, use `active` (strictly after today) so that
-        # on expiry day itself the system rolls to the next month. MCX monthly
-        # options expire mid-session; keeping today's expiry as `current_month`
-        # all day would mean trading on a contract that's already closed.
+        # Use `active` (strictly after today) so expiry-day contracts are excluded.
         ref = active if active else future
+        # Skip contracts expiring today or tomorrow — MCX monthly options lose
+        # all liquidity on their final day (settlement at noon/afternoon). A
+        # 1-day buffer ensures the system switches to the next live monthly
+        # contract one day early (e.g. GOLD May 27 → June 30 on May 26).
+        tomorrow = (today + timedelta(days=1)).isoformat()
+        ref_no_near = [e for e in ref if e > tomorrow]
+        if ref_no_near:
+            ref = ref_no_near
         months_order = []
         for e in ref:
             ym = e[:7]
