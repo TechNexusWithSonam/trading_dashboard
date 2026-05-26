@@ -984,18 +984,28 @@ async def fetch_intraday_candles(key: str, token: str,
 
 def get_current_and_next_expiry(expiries: list, symbol: str) -> dict:
     today  = date.today()
-    future = sorted([e for e in expiries if e >= today.isoformat()])
-    # Skip expiries within 3 days — near-expiry MCX contracts are often
-    # delisted or have no open interest before their last day.
-    near_cutoff = (today + timedelta(days=3)).isoformat()
-    active = [e for e in future if e > near_cutoff] or future
-    result = {"all": expiries, "default": active[0] if active else None}
+    today_s = today.isoformat()
+    # future: all expiries on or after today (includes today's expiry so the
+    # system stays on the live contract all day — roll only after it passes)
+    future = sorted([e for e in expiries if e >= today_s])
+    # active: expiries strictly after today (used for current/next labels and
+    # default after the expiry date has passed at EOD).
+    # On the expiry date itself, today's expiry is in `future` but NOT in
+    # `active`, so the day-change rollover (midnight tick) moves the default
+    # forward. Prior to the expiry date, today's expiry IS in `active`.
+    # No near_cutoff buffer — the old +3-day cutoff caused premature switches
+    # (e.g. NIFTY showed next-week options from Monday for a Thursday expiry).
+    active = [e for e in future if e > today_s] or future
+
+    # default = future[0]: stay on the current expiry ALL DAY including expiry
+    # day itself; roll forward only after the date passes (day-after rollover).
+    # active[0] would skip to next expiry ON expiry day (wrong for intraday trading).
+    result = {"all": expiries, "default": future[0] if future else None}
+
     if symbol.upper() in MONTHLY_SYMBOLS:
-        # Group unexpired expiries by year-month in order. The first live
-        # month is "current_month" and the second is "next_month". Once the
-        # calendar month's options have all expired this naturally rolls the
-        # labels forward — e.g. on 17 Apr after Crude's 16 Apr options die,
-        # current_month = 14 May and next_month = June expiry.
+        # Group by calendar-month. First live month = current_month, second = next_month.
+        # On expiry day itself, today's expiry IS still in `future` so current_month
+        # correctly reflects the live month. After it passes, months_order shifts.
         months_order = []
         for e in future:
             ym = e[:7]
@@ -1004,8 +1014,14 @@ def get_current_and_next_expiry(expiries: list, symbol: str) -> dict:
         def _last_in(ym): return [e for e in future if e.startswith(ym)][-1]
         result["current_month"] = _last_in(months_order[0]) if len(months_order) > 0 else None
         result["next_month"]    = _last_in(months_order[1]) if len(months_order) > 1 else None
+        # default = current_month (the live monthly contract), consistent with label.
+        result["default"] = result["current_month"]
     else:
-        result["current_week"] = active[0] if len(active)>0 else None
-        result["next_week"]    = active[1] if len(active)>1 else None
-        result["far_week"]     = active[2] if len(active)>2 else None
+        # Non-MCX (Index weekly/monthly + FO stocks):
+        # current_week = live expiry (includes today on expiry day)
+        # next/far = upcoming expiries AFTER current_week
+        result["current_week"] = future[0] if future else None
+        rest = [e for e in active if e != result["current_week"]]
+        result["next_week"] = rest[0] if len(rest) > 0 else None
+        result["far_week"]  = rest[1] if len(rest) > 1 else None
     return result

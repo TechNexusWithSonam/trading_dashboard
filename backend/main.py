@@ -760,7 +760,12 @@ def _align_mcx_spot_to_options() -> list:
     `_validated_mcx`, `SPOT_KEYS_D`, `FEED_KEY_TO_SYM`, and `COMMODITY_KEYS`
     in place. Returns a list of (sym, old_key, new_key, default_expiry)
     tuples for rolled-over symbols so callers can decide whether to
-    re-subscribe the WS feed."""
+    re-subscribe the WS feed.
+
+    Name-based keys (instrument master not yet updated for a far-future month)
+    are accepted for SPOT_KEYS_D / FEED_KEY_TO_SYM (REST quotes work fine)
+    but are kept OUT of COMMODITY_KEYS (WS feed requires numeric keys).
+    """
     global COMMODITY_KEYS
     from datetime import date as _dc
     today_d = _dc.today()
@@ -776,22 +781,33 @@ def _align_mcx_spot_to_options() -> list:
         if (yr, mo) == (today_d.year, today_d.month):
             continue  # default option is in the current calendar month
         new_spot = mcx_key_for_month(sym, yr, mo)
-        tail = new_spot.split("|", 1)[1] if "|" in new_spot else ""
-        if not tail or not tail[:1].isdigit():
-            continue  # name-based fallback — not a real master key
+        if not new_spot: continue
         old_spot = _instruments_mod._validated_mcx.get(sym) or SPOT_KEYS_D.get(sym)
         if old_spot == new_spot:
             continue
+        tail = new_spot.split("|", 1)[1] if "|" in new_spot else ""
+        is_numeric = bool(tail and tail[:1].isdigit())
+        # Always update SPOT_KEYS_D / FEED_KEY_TO_SYM — REST quotes and
+        # option chain fetch both accept name-based keys. WS feed requires
+        # numeric keys, so name-based spot keys are NOT added to COMMODITY_KEYS.
         _instruments_mod._validated_mcx[sym] = new_spot
         SPOT_KEYS_D[sym] = new_spot
         if old_spot and FEED_KEY_TO_SYM.get(old_spot) == sym:
             del FEED_KEY_TO_SYM[old_spot]
         FEED_KEY_TO_SYM[new_spot] = sym
         rolled.append((sym, old_spot, new_spot, defx))
-        print(f"[MCX Rollover] {sym}: {old_spot} → {new_spot} (active option expiry={defx})")
+        print(f"[MCX Rollover] {sym}: {old_spot} → {new_spot} "
+              f"(expiry={defx}, numeric={is_numeric})")
 
     if rolled:
-        primary = [SPOT_KEYS_D[s] for s in _MCX_LOC if s in SPOT_KEYS_D]
+        primary = []
+        for s in _MCX_LOC:
+            k = SPOT_KEYS_D.get(s, "")
+            if not k: continue
+            t = k.split("|", 1)[1] if "|" in k else ""
+            # Only numeric keys can receive WS ticks
+            if t and t[:1].isdigit():
+                primary.append(k)
         next_mo = []
         for s in _MCX_LOC:
             nm = (state.expiry_cache.get(s) or {}).get("next_month") or ""
@@ -951,12 +967,17 @@ async def _refresh_chains_for_rolled(chain_refresh: dict, parallel: bool = False
 
 
 async def _daily_rollover_check():
-    """Fires once per calendar day from periodic_refresh. Rolls over LOC
-    symbols whose current `default` option expiry has passed:
+    """Fires from periodic_refresh. Rolls over LOC symbols whose current
+    `default` option expiry has passed:
 
       • Indices (NIFTY/SENSEX weekly + BANKNIFTY/FINNIFTY/MIDCPNIFTY/BANKEX monthly)
       • MCX commodities (monthly; spot futures realigned to active option month)
       • F&O stocks (~130 symbols, monthly)
+
+    Gated to once per calendar day normally. Exception: re-fires within the
+    same day when ANY priority symbol's default expiry is strictly in the
+    past (< today) — handles intraday expiry (e.g. MCX options at 5 PM) so
+    the system doesn't stay stuck on an expired contract until midnight.
 
     Phase A (priority, blocking): indices + MCX. Runs expiry check,
     MCX spot alignment + OHLC prime, chain + CE/PE OHLC refresh for rolled
@@ -970,7 +991,18 @@ async def _daily_rollover_check():
     global _last_rollover_check_date
     from datetime import date as _dc
     today_d = _dc.today()
-    if _last_rollover_check_date == today_d: return
+    today_s = today_d.isoformat()
+
+    # Re-run even on the same calendar day if any priority symbol's default
+    # expiry is strictly past — intraday rollover safety net.
+    priority_syms = _INDEX_LOC + _MCX_LOC
+    has_expired_default = any(
+        (state.expiry_cache.get(s) or {}).get("default", "") < today_s
+        for s in priority_syms
+        if state.expiry_cache.get(s)
+    )
+    if _last_rollover_check_date == today_d and not has_expired_default:
+        return
     _last_rollover_check_date = today_d
     if not state.access_token: return
 
