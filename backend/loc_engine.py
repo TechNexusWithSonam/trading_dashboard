@@ -108,10 +108,10 @@ def calc_loc_25(spot_ltp, spot_close, spot_high, spot_low, spot_open,
     else:                           f15=abs(ac-ab)
 
     f16=f15*s
-    f17=s+f16 if ab<ac else(s-f16 if ab>ac else s)
+    f17=s+f16 if ce_l<pe_l else(s-f16 if ce_l>pe_l else s)
     f18=s+abs(ab)*s if ab<0 else(s-abs(ab)*s if ab>0 else s)
     f19=s-abs(ac)*s if ac<0 else(s+abs(ac)*s if ac>0 else s)
-    f20=f17*1.001; f21=f17*0.999; f22=f20-f18; f23=f21-f19
+    f20=f17*1.0; f21=f17*1.0; f22=f20-f18; f23=f21-f19
     f24=s+f22; f25=s+f23
 
     # zone=("CALL" if s>f24 and s>f25 and s>f20 else
@@ -171,14 +171,26 @@ class LOCEngine:
         st=self.symbols.get(symbol)
         if not st or not ltp: return
         st.spot.ltp  = ltp
-        # Only overwrite OHLC fields when the caller supplied a real value.
-        # Partial WS ticks send only ltp/cp; the old `or ltp` fallback wrote
-        # ltp into high/low/open and clobbered the real session values that
-        # an earlier full tick (or REST snapshot) had set.
-        if close > 0: st.spot.close = close
-        if high  > 0: st.spot.high  = high
-        if low   > 0: st.spot.low   = low
-        if open_ > 0: st.spot.open  = open_
+        # OHLC accumulation: use WS-provided values when present (full marketFF
+        # ticks); for partial ticks that send ltp only (high/low == 0), accumulate
+        # rolling intraday max/min so frontend always sees real values, not ltp.
+        if high > 0:
+            st.spot.high = high
+        elif st.spot.high > 0:
+            st.spot.high = max(st.spot.high, ltp)
+        else:
+            st.spot.high = ltp
+        if low > 0:
+            st.spot.low = low
+        elif st.spot.low > 0:
+            st.spot.low = min(st.spot.low, ltp)
+        else:
+            st.spot.low = ltp
+        if close > 0:
+            st.spot.close = close
+        elif not st.spot.close:
+            st.spot.close = ltp   # seed until real prev-close arrives
+        if open_ > 0: st.spot.open = open_
         st.spot.ts   = ts
 
         # ATM shift detection — use debounce (only act if ATM actually changes)
