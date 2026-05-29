@@ -108,7 +108,7 @@ def calc_loc_25(spot_ltp, spot_close, spot_high, spot_low, spot_open,
     else:                           f15=abs(ac-ab)
 
     f16=f15*s
-    f17=s+f16 if ce_l<pe_l else(s-f16 if ce_l>pe_l else s)
+    f17=s+f16 if ab<ac else(s-f16 if ab>ac else s)
     f18=s+abs(ab)*s if ab<0 else(s-abs(ab)*s if ab>0 else s)
     f19=s-abs(ac)*s if ac<0 else(s+abs(ac)*s if ac>0 else s)
     f20=f17*1.0; f21=f17*1.0; f22=f20-f18; f23=f21-f19
