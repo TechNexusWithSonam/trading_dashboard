@@ -636,6 +636,16 @@ async def startup_init():
     if state.access_token:
         await _refresh_all_option_ohlc()
 
+    # Step 9: Subscribe all CE/PE option keys gathered from chains.
+    # start_feed() subscribes option keys at WS-connect time, but the WS
+    # connects before chains are loaded (3-second head-start), so
+    # get_option_keys() returns [] there. After chains load here we must
+    # explicitly push the keys to the live feed — otherwise CE/PE LTP
+    # won't update until the first ATM shift or the 60-second periodic refresh.
+    if state.upstox_ws:
+        await _subscribe_new_option_keys()
+        print(f"[Init] Option keys subscribed to WS: {len(loc_engine.get_option_keys())} keys")
+
 
 async def _refresh_option_ohlc_single(symbol: str):
     """Fetch actual intraday OHLC for a single symbol's CE/PE via REST.
