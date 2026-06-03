@@ -72,6 +72,7 @@ SPOT_KEYS_D: dict = {}   # filled at startup
 FEED_KEY_TO_SYM: dict = {}
 option_key_map:      dict = {}   # LOC option key → (symbol, "CE"/"PE")
 calc_option_key_map: dict = {}   # Calculator option key → (symbol, "CE"/"PE")
+option_key_last_tick: dict = {}  # instrument_key → last WS tick timestamp (for stale detection)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -345,6 +346,7 @@ class AppState:
     _feed_buffer: dict = {}       # buffered feeds for throttled broadcast
     _feed_buffer_lock = None      # asyncio.Lock, created at startup
     _flush_task = None
+    _loc_dirty: set = set()       # symbols whose loc_result changed since last flush
 
 state = AppState()
 
@@ -362,8 +364,9 @@ loc_engine = LOCEngine()
 
 async def _on_loc(symbol: str, result: dict):
     _record_loc_hist(symbol, result)
-    # LOC results are sent via throttled live_feed flush (loc_results field)
-    # No need to broadcast individually — avoids per-tick flickering
+    # Mark dirty so _flush_feed_buffer sends loc_results on next cycle,
+    # even if no instrument feed ticks are buffered at that moment.
+    state._loc_dirty.add(symbol)
 
 loc_engine.on_loc_update = _on_loc
 for sym in LOC_SYMBOLS:
@@ -419,6 +422,7 @@ def _route_tick(key, ltp, cp, o, h, l, ts):
                 option_key_map.pop(key, None)
             else:
                 loc_engine.update_option_from_feed(sym_m, opt_type, ltp, cp, h, l)
+                option_key_last_tick[key] = time.time()  # record live tick for stale detection
     # ── Calculator option routing (parallel, decoupled from LOC) ───
     cmap = calc_option_key_map.get(key)
     if not cmap:
@@ -747,7 +751,16 @@ async def _subscribe_new_option_keys():
     if new_keys:
         await _sub_binary(state.upstox_ws, new_keys, "full")
         state.subscribed_option_keys.update(new_keys)
-        print(f"[Options] Subscribed {len(new_keys)} option keys: {new_keys[:2]}")
+        # Log every key individually so subscription can be verified in logs
+        for key in new_keys:
+            sym_info = option_key_map.get(key) or calc_option_key_map.get(key)
+            label = f"{sym_info[0]}/{sym_info[1]}" if sym_info else "unknown"
+            print(f"[Options] Subscribed key={key} → {label}")
+        print(f"[Options] Total subscribed: {len(state.subscribed_option_keys)} option keys")
+        # Immediately validate new keys via REST — confirms broker has them active
+        # and primes LTP/OHLC before the first WS tick arrives
+        if state.access_token:
+            asyncio.create_task(_validate_and_prime_option_keys(new_keys))
     # Always rebuild BOTH maps from current engine state — even when no new
     # WS subscription is needed. An ATM shift back to a previously-seen
     # strike leaves the strike in state.subscribed_option_keys (so new_keys
@@ -761,6 +774,88 @@ async def _subscribe_new_option_keys():
     for sn, calc in loc_engine.calc_states.items():
         if calc.ce.instrument_key: calc_option_key_map[calc.ce.instrument_key] = (sn,"CE")
         if calc.pe.instrument_key: calc_option_key_map[calc.pe.instrument_key] = (sn,"PE")
+
+async def _validate_and_prime_option_keys(keys: list):
+    """After subscribing new option keys, immediately verify them via REST quote.
+    Logs WARNING for any key not found (invalid/expired), and primes LTP/OHLC
+    so the LOC engine has real data before the first WS tick arrives."""
+    if not keys or not state.access_token: return
+    batch = keys[:30]  # REST quote accepts up to ~30 keys at once
+    try:
+        data = await fetch_quotes_rest(batch, state.access_token)
+        for k in batch:
+            if k in data:
+                ltp = data[k].get("ltpc", {}).get("ltp", 0)
+                print(f"[Options] REST verify OK: {k} ltp={ltp}")
+            else:
+                print(f"[Options] WARNING: {k} not found in REST quote — key may be inactive or expired")
+    except Exception as e:
+        print(f"[Options] REST verify error: {e}")
+
+
+async def _stale_fetch_option_ltp(symbol: str):
+    """Force-fetch LTP for a symbol's CE and PE option keys via REST and inject
+    into the LOC engine. Unlike _refresh_option_ohlc_single, this always
+    overwrites LTP (not guarded by 'ltp==0') — used when WS ticks have been
+    absent for >30 seconds so the LOC engine reflects the last traded price."""
+    if not state.access_token: return
+    st = loc_engine.get_state(symbol)
+    if not st or not st.ce.instrument_key: return
+    data = await fetch_option_ohlc_rest(
+        st.ce.instrument_key, st.pe.instrument_key, state.access_token)
+    if not data: return
+    changed = False
+    ce_d = data.get(st.ce.instrument_key, {})
+    pe_d = data.get(st.pe.instrument_key, {})
+    if ce_d:
+        if ce_d.get("ltp"):  st.ce.ltp   = ce_d["ltp"];   changed = True
+        if ce_d.get("close"): st.ce.close = ce_d["close"]
+        if ce_d.get("high"):  st.ce.high  = ce_d["high"]
+        if ce_d.get("low"):   st.ce.low   = ce_d["low"]
+    if pe_d:
+        if pe_d.get("ltp"):  st.pe.ltp   = pe_d["ltp"];   changed = True
+        if pe_d.get("close"): st.pe.close = pe_d["close"]
+        if pe_d.get("high"):  st.pe.high  = pe_d["high"]
+        if pe_d.get("low"):   st.pe.low   = pe_d["low"]
+    if changed:
+        loc_engine.recalc(symbol)
+        print(f"[Stale] {symbol} REST injected: ce_ltp={st.ce.ltp} pe_ltp={st.pe.ltp}")
+
+
+async def _stale_option_monitor():
+    """Background task: every 30 s check if any subscribed option key has
+    received no WS tick. If stale, fall back to REST to fetch LTP and inject
+    into the LOC engine — so LOC never freezes due to a dead WS key.
+
+    Bug 1 fix: catches CRUDEOIL PE (and any other option) that is subscribed
+    but whose exchange feed delivers no ticks (illiquid strike, MCX WS issue)."""
+    STALE_SEC = 30
+    # Give startup a full minute before first check so chains/OHLC have loaded.
+    await asyncio.sleep(60)
+    while True:
+        await asyncio.sleep(STALE_SEC)
+        if not state.access_token: continue
+        now = time.time()
+        for sym in list(loc_engine.symbols):
+            st = loc_engine.get_state(sym)
+            if not st: continue
+            ce_key = st.ce.instrument_key
+            pe_key = st.pe.instrument_key
+            stale_parts = []
+            if ce_key and (now - option_key_last_tick.get(ce_key, 0)) > STALE_SEC:
+                age = int(now - option_key_last_tick.get(ce_key, 0))
+                stale_parts.append(f"CE={ce_key}(age={age}s)")
+            if pe_key and (now - option_key_last_tick.get(pe_key, 0)) > STALE_SEC:
+                age = int(now - option_key_last_tick.get(pe_key, 0))
+                stale_parts.append(f"PE={pe_key}(age={age}s)")
+            if stale_parts:
+                print(f"[Stale] {sym} no WS tick: {' | '.join(stale_parts)} — REST fallback")
+                try:
+                    await _stale_fetch_option_ltp(sym)
+                except Exception as e:
+                    print(f"[Stale] {sym} REST fallback error: {e}")
+                await asyncio.sleep(0.2)  # small gap between symbols to avoid rate limit
+
 
 async def _refresh_prev_close_cache():
     """Re-derive state.prev_close from REST so MCX fallback doesn't go stale
@@ -1272,14 +1367,29 @@ async def _send_to_clients(msg: dict):
 FEED_THROTTLE_MS = 300  # send at most ~3 updates/sec to frontend
 
 async def _flush_feed_buffer():
-    """Background task: flush buffered feed ticks to frontend at throttled rate."""
+    """Background task: flush buffered feed ticks + LOC results to frontend.
+
+    Fires whenever:
+    - There are buffered instrument feed ticks (live price ticks), OR
+    - Any LOC symbol was recalculated since the last flush (_loc_dirty).
+
+    This decouples LOC broadcasts (bop, cep, pep, zone…) from instrument
+    ticks — so BOP updates reach the frontend even when an option key has
+    no live WS tick (e.g. stale CRUDEOIL PE during illiquid periods).
+    Bug 2 fix: loc_results are sent on every recalc, not just on feed ticks.
+    """
     while True:
         await asyncio.sleep(FEED_THROTTLE_MS / 1000)
-        if not state._feed_buffer or not state.connected_clients:
+        if not state.connected_clients:
             continue
-        # Swap buffer atomically
+        has_feeds = bool(state._feed_buffer)
+        has_loc   = bool(state._loc_dirty)
+        if not has_feeds and not has_loc:
+            continue
+        # Swap buffers atomically before await so concurrent updates queue up
         feeds = state._feed_buffer
         state._feed_buffer = {}
+        state._loc_dirty.clear()
         msg = {
             "type": "live_feed",
             "feeds": feeds,
@@ -1755,6 +1865,9 @@ async def on_startup():
 
     # Start throttled feed flush task
     state._flush_task = asyncio.create_task(_flush_feed_buffer())
+
+    # Start stale-option monitor (Bug 1 fallback: REST fetch when WS tick absent)
+    asyncio.create_task(_stale_option_monitor())
 
     asyncio.create_task(_delayed_startup())
 

@@ -49,6 +49,8 @@ class SymbolState:
     loc_result:dict=field(default_factory=dict)
     last_atm:float=0
     chain_spot:float=0
+    # Timestamps of last WS tick for CE/PE — used by stale-option REST fallback
+    ce_last_tick:float=0; pe_last_tick:float=0
 
 
 @dataclass
@@ -258,6 +260,11 @@ class LOCEngine:
         opt = st.ce if opt_type=="CE" else st.pe
         if ltp and ltp>0:
             opt.ltp = ltp
+            # Track last WS tick time for stale-option REST fallback (Bug 1)
+            if opt_type == "CE":
+                st.ce_last_tick = time.time()
+            else:
+                st.pe_last_tick = time.time()
             # Intraday high/low: use WS-provided values (full marketFF ticks)
             # when available; otherwise accumulate rolling max/min from ltp.
             # Option WS ticks are often firstLevelWithGreeks which omits efeed
@@ -443,6 +450,11 @@ class LOCEngine:
               f"PE@{st.pe_strike}=ltp:{st.pe.ltp} close:{st.pe.close} "
               f"eff:{st.pe.effective_ltp} "
               f"key:{st.pe.instrument_key[:20] if st.pe.instrument_key else 'MISS'}")
+        # Seed tick timestamps so REST fallback waits 30s after each chain load
+        # before assuming the key is silent (gives WS feed a chance to deliver)
+        now = time.time()
+        st.ce_last_tick = now
+        st.pe_last_tick = now
         self._recalc(symbol)
 
     def _recalc(self, symbol:str):
