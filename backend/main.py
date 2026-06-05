@@ -751,6 +751,11 @@ async def _subscribe_new_option_keys():
     if new_keys:
         await _sub_binary(state.upstox_ws, new_keys, "full")
         state.subscribed_option_keys.update(new_keys)
+        # Seed tick timestamps so stale monitor gives a 30s grace period before
+        # REST fallback fires (prevents mass REST calls at startup for all symbols)
+        now = time.time()
+        for key in new_keys:
+            option_key_last_tick[key] = now
         # Log every key individually so subscription can be verified in logs
         for key in new_keys:
             sym_info = option_key_map.get(key) or calc_option_key_map.get(key)
@@ -807,12 +812,17 @@ async def _stale_fetch_option_ltp(symbol: str):
     changed = False
     ce_d = data.get(st.ce.instrument_key, {})
     pe_d = data.get(st.pe.instrument_key, {})
+    now = time.time()
     if ce_d:
+        # Update tick timestamp regardless of ltp — prevents refiring every 30s
+        # for illiquid keys where REST also returns ltp=0
+        option_key_last_tick[st.ce.instrument_key] = now
         if ce_d.get("ltp"):  st.ce.ltp   = ce_d["ltp"];   changed = True
         if ce_d.get("close"): st.ce.close = ce_d["close"]
         if ce_d.get("high"):  st.ce.high  = ce_d["high"]
         if ce_d.get("low"):   st.ce.low   = ce_d["low"]
     if pe_d:
+        option_key_last_tick[st.pe.instrument_key] = now
         if pe_d.get("ltp"):  st.pe.ltp   = pe_d["ltp"];   changed = True
         if pe_d.get("close"): st.pe.close = pe_d["close"]
         if pe_d.get("high"):  st.pe.high  = pe_d["high"]
@@ -1448,6 +1458,10 @@ async def start_feed():
                 if opt_keys:
                     await _sub_binary(ws, opt_keys, "full")
                     state.subscribed_option_keys.update(opt_keys)
+                    # Seed tick timestamps so stale monitor gives 30s grace
+                    _now = time.time()
+                    for _k in opt_keys:
+                        option_key_last_tick[_k] = _now
                     for st_sym in loc_engine.symbols.values():
                         if st_sym.ce.instrument_key:
                             option_key_map[st_sym.ce.instrument_key] = (st_sym.symbol,"CE")
