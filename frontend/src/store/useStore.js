@@ -42,7 +42,13 @@ const useStore=create((set,get)=>({
   // Live feed tick — FORCE new object references so React re-renders
   onLiveFeed:(msg)=>set(s=>{
     const feeds = msg.feeds || {}
-    if(!Object.keys(feeds).length) return {}   // nothing changed
+    const hasFeeds = Object.keys(feeds).length > 0
+    const newLoc   = msg.loc_results || {}
+    const hasLoc   = Object.keys(newLoc).length > 0
+    if(!hasFeeds && !hasLoc) return {}   // nothing changed
+
+    // Only LOC recalculated (chain refresh, stale REST) — no price ticks this cycle
+    if(!hasFeeds) return { locResults: { ...s.locResults, ...newLoc } }
 
     // Build completely new marketData object
     const md = Object.assign({}, s.marketData)
@@ -83,9 +89,7 @@ const useStore=create((set,get)=>({
 
     return {
       marketData: md,
-      locResults: Object.keys(msg.loc_results || {}).length
-                    ? { ...s.locResults, ...msg.loc_results }
-                    : s.locResults,
+      locResults: hasLoc ? { ...s.locResults, ...newLoc } : s.locResults,
       frames:    s.frames + 1,
       tickCount: s.tickCount + Object.keys(feeds).length,
       instrCount:Object.keys(md).length,
