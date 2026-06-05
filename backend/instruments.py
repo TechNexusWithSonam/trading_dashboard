@@ -1021,6 +1021,13 @@ async def fetch_intraday_candles(key: str, token: str,
     return []
 
 
+def _is_past_market_close_ist() -> bool:
+    """True when IST clock is past 15:35 — NSE options have settled for the day."""
+    from datetime import datetime, timezone, timedelta as _td
+    now_ist = datetime.now(timezone.utc) + _td(hours=5, minutes=30)
+    return now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 35)
+
+
 def get_current_and_next_expiry(expiries: list, symbol: str) -> dict:
     today  = date.today()
     today_s = today.isoformat()
@@ -1035,6 +1042,16 @@ def get_current_and_next_expiry(expiries: list, symbol: str) -> dict:
     # No near_cutoff buffer — the old +3-day cutoff caused premature switches
     # (e.g. NIFTY showed next-week options from Monday for a Thursday expiry).
     active = [e for e in future if e > today_s] or future
+
+    # Post-market intraday rollover: after NSE market close (15:35 IST) on
+    # the expiry day itself, advance `future` to skip the settled contract so
+    # LOC shows next-week data instead of settled/zero option prices.
+    # MCX monthly symbols are excluded — they have their own 1-day buffer.
+    if (symbol.upper() not in MONTHLY_SYMBOLS
+            and future and future[0] == today_s
+            and len(active) > 0 and active[0] != today_s
+            and _is_past_market_close_ist()):
+        future = active  # drop today's expired contract
 
     # default = future[0]: stay on the current expiry ALL DAY including expiry
     # day itself; roll forward only after the date passes (day-after rollover).

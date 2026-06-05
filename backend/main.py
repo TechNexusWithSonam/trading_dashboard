@@ -44,7 +44,7 @@ from .instruments import (
     fetch_option_ohlc_rest, fetch_intraday_candles,
     validate_mcx_keys, calculate_expiries_fallback,
     normalize_mcx_response_key, normalize_response_key,
-    refresh_nse_eq_keys, STRIKE_STEPS, MONTHLY_SYMBOLS
+    refresh_nse_eq_keys, STRIKE_STEPS, MONTHLY_SYMBOLS, _is_past_market_close_ist
 )
 from . import instruments as _instruments_mod
 from . import instrument_keys as _ik
@@ -1154,6 +1154,15 @@ async def _daily_rollover_check():
         for s in priority_syms
         if state.expiry_cache.get(s)
     )
+    # Post-market intraday rollover: if today IS any priority symbol's expiry
+    # and NSE market has closed (15:35 IST), treat it as expired so we roll
+    # to the next contract without waiting until midnight.
+    if not has_expired_default and _is_past_market_close_ist():
+        has_expired_default = any(
+            (state.expiry_cache.get(s) or {}).get("default", "") == today_s
+            for s in priority_syms
+            if state.expiry_cache.get(s)
+        )
     if _last_rollover_check_date == today_d and not has_expired_default:
         return
     _last_rollover_check_date = today_d
