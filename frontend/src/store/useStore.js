@@ -18,6 +18,7 @@ const useStore=create((set,get)=>({
   locResults:{},
   expiryCache:{},
   locHistory:{},
+  flipTimes:{},   // sym → {time:"HH:MM", date:"YYYY-MM-DD"}
   watchlists:{},
   commodityKeys:[],
   spotKeys:{},
@@ -97,9 +98,35 @@ const useStore=create((set,get)=>({
   }),
 
   // Individual LOC update — pushed on every recalc
-  onLiveLoc:(msg)=>set(s=>({
-    locResults:{ ...s.locResults, [msg.symbol]: msg.loc },
-  })),
+  onLiveLoc:(msg)=>set(s=>{
+    const sym = msg.symbol
+    const newLoc = msg.loc
+    const prevLoc = s.locResults[sym]
+    const newFlip = {...s.flipTimes}
+
+    // Detect zone/direction flip (positive↔negative or zone change)
+    const prevZone = prevLoc?.zone
+    const newZone  = newLoc?.zone
+    const prevDir  = prevLoc?.direction
+    const newDir   = newLoc?.direction
+    const now = new Date()
+    const todayStr = now.toISOString().slice(0,10)  // "YYYY-MM-DD"
+    const timeStr  = now.toLocaleTimeString("en-IN",{hour12:false,hour:"2-digit",minute:"2-digit"})
+
+    // Reset if it's a new day (morning refresh)
+    const prevEntry = s.flipTimes[sym]
+    if(prevEntry && prevEntry.date !== todayStr) delete newFlip[sym]
+
+    // Record flip when zone or direction changes
+    if(prevLoc && ((prevZone !== newZone) || (prevDir !== newDir))){
+      newFlip[sym] = {time: timeStr, date: todayStr, from: prevZone, to: newZone}
+    }
+
+    return {
+      locResults:{ ...s.locResults, [sym]: newLoc },
+      flipTimes: newFlip,
+    }
+  }),
 
   onMarketInfo:(msg)=>set({
     marketStatus: msg.marketInfo?.segmentStatus || {},

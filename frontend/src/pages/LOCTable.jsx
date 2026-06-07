@@ -17,15 +17,16 @@ const fmt4=v=>(v==null||isNaN(v))?"—":v.toFixed(4)
 const fmt2=v=>(v==null||isNaN(v))?"—":fmt(v)
 
 export default function LOCTable({onOpenChart}){
-  const{locResults,spotKeys}=useStore()
+  const{locResults,spotKeys,flipTimes}=useStore()
   const[filter,setFilter]=useState("all")
   const[search,setSearch]=useState("")
   const[sort,setSort]=useState({k:"symbol",d:1})
   const rows=useMemo(()=>{
-    let arr=Object.entries(locResults).map(([sym,loc])=>({sym,loc,meta:getMeta(sym)}))
+    let arr=Object.entries(locResults).map(([sym,loc])=>({sym,loc,meta:getMeta(sym),ft:flipTimes[sym]?.time||""})) 
     if(search){const q=search.toUpperCase();arr=arr.filter(r=>r.sym.toUpperCase().includes(q))}
     if(filter==="CALL"||filter==="PUT"||filter==="WAIT")arr=arr.filter(r=>r.loc.zone===filter)
     arr.sort((a,b)=>{
+      if(sort.k==="flip_time")return sort.d*a.ft.localeCompare(b.ft)
       if(sort.k==="symbol")return sort.d*a.sym.localeCompare(b.sym)
       const av=a.loc[sort.k]||0,bv=b.loc[sort.k]||0
       return sort.d*(av-bv)
@@ -56,6 +57,7 @@ export default function LOCTable({onOpenChart}){
       <div style={{overflow:"auto",border:"1px solid #162033",borderRadius:8,maxHeight:"calc(100vh - 110px)"}}>
         <table style={{width:"max-content",minWidth:"100%",borderCollapse:"collapse",fontSize:10}}>
           <thead><tr>
+            <TH label="Flip Time" k="flip_time" {...thP}/>
             {/* Spot Data */}
             <TH label="Symbol" k="symbol" {...thP} sticky/>
             <TH label="Spot LTP" k="ltp" {...thP} num/>
@@ -123,6 +125,10 @@ export default function LOCTable({onOpenChart}){
               <tr key={sym} onClick={()=>onOpenChart(spotKeys[sym]||SYM_TO_KEY[sym]||sym)} style={{cursor:"pointer"}}
                 onMouseEnter={e=>e.currentTarget.style.background="rgba(255,255,255,.015)"}
                 onMouseLeave={e=>e.currentTarget.style.background=""}>
+                {/* Flip Time */}
+                <td style={{...cellBase,color:"#ffc94d",whiteSpace:"nowrap"}}>
+                  {flipTimes[sym] ? `${flipTimes[sym].time} (${flipTimes[sym].from||'?'}→${flipTimes[sym].to||'?'})` : "—"}
+                </td>
                 {/* Symbol - sticky */}
                 <td style={{...cellBase,fontWeight:700,position:"sticky",left:0,background:"#0a0f1a",zIndex:1}}>{sym}</td>
                 {/* Spot */}
