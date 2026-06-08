@@ -164,7 +164,9 @@ export default function LOCTable({onOpenChart}){
                 {/* Diffs */}
                 <td style={{...numR,color:loc.call_cp_diff<0?"#ff3d5a":"#00e676"}}>{fmt4(loc.call_cp_diff)}</td>
                 <td style={{...numR,color:loc.put_cp_diff<0?"#ff3d5a":"#00e676"}}>{fmt4(loc.put_cp_diff)}</td>
-                <td style={numR}>{fmt4(loc.different)}</td>
+                <td style={{...numR,color:(loc.different!=null&&loc.different!==0)?((-loc.different)<0?"#ff3d5a":"#00e676"):"#4a5568"}}>
+                  {(loc.different==null||isNaN(loc.different)||loc.different===0)?"—":(-loc.different).toFixed(4)}
+                </td>
                 {/* Zone */}
                 <td style={cellBase}>
                   <span style={{padding:"2px 6px",borderRadius:2,fontSize:9,fontFamily:mono,fontWeight:700,

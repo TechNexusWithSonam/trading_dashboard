@@ -336,6 +336,18 @@ export default function ChartModal({ instrKey: rawKey, onClose }) {
                   </div>
                 ))}
                 <div style={{ marginTop: 8 }}>
+                  {/* Different — sign-inverted, blank when zero */}
+                  {(loc.different != null && loc.different !== 0) && (
+                    <div style={{
+                      display: "flex", justifyContent: "space-between", padding: "4px 0",
+                      fontFamily: "'JetBrains Mono',monospace", fontSize: 10, borderBottom: "1px solid #1a2538"
+                    }}>
+                      <span style={{ color: "#8a9bb5", fontWeight: 600 }}>Different</span>
+                      <span style={{ fontWeight: 700, color: (-loc.different) < 0 ? "#ff3d5a" : "#00e676" }}>
+                        {(-loc.different).toFixed(4)}
+                      </span>
+                    </div>
+                  )}
                   {[["FUL", loc.ful, 2, "#ff3d5a"], ["FLL", loc.fll, 2, "#00e676"],
                   ["FUL Diff", loc.ful_diff, 2, "#ff3d5a"], ["FLL Diff", loc.fll_diff, 2, "#00e676"],
                   ].map(([k, v, dp, c]) => (

@@ -25,8 +25,10 @@ export default function History(){
   },[sym])
   function exportCSV(){
     if(!hist.length)return
-    const hdr="Time,LTP,CEP,BOP,PEP,UL,LL,Zone,Change,CE Strike,PE Strike\n"
-    const rows=hist.map(h=>[ts2t(h.ts),h.ltp,h.cep,h.bop,h.pep,h.ul,h.ll,h.zone,h.change,h.ce_strike,h.pe_strike].join(",")).join("\n")
+    const hdr="Time,LTP,CEP,BOP,PEP,UL,LL,Zone,Change,Different,CE Strike,PE Strike\n"
+    const rows=hist.map(h=>[ts2t(h.ts),h.ltp,h.cep,h.bop,h.pep,h.ul,h.ll,h.zone,h.change,
+      (h.different!=null&&h.different!==0)?(-h.different).toFixed(4):"",
+      h.ce_strike,h.pe_strike].join(",")).join("\n")
     const blob=new Blob([hdr+rows],{type:"text/csv"})
     const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`loc_${sym}.csv`;a.click()
   }
@@ -45,13 +47,13 @@ export default function History(){
       <div style={{overflowX:"auto",border:"1px solid #162033",borderRadius:8}}>
         <table style={{width:"100%",borderCollapse:"collapse",fontSize:10}}>
           <thead>
-            <tr>{["Time","LTP","CEP","BOP","PEP","UL","LL","Zone","Chg","CE Stk","PE Stk"].map(h=>(
+            <tr>{["Time","LTP","CEP","BOP","PEP","UL","LL","Zone","Chg","Diff","CE Stk","PE Stk"].map(h=>(
               <th key={h} style={{padding:"7px 10px",textAlign:h==="Time"||h==="Zone"?"left":"right",fontFamily:"'JetBrains Mono',monospace",
                 fontSize:8,textTransform:"uppercase",color:"#4a5568",background:"#0f1624",borderBottom:"1px solid #162033"}}>{h}</th>
             ))}</tr>
           </thead>
           <tbody>
-            {hist.length===0?<tr><td colSpan={11} style={{padding:20,textAlign:"center",color:"#4a5568",fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>No history yet — records every minute</td></tr>
+            {hist.length===0?<tr><td colSpan={12} style={{padding:20,textAlign:"center",color:"#4a5568",fontFamily:"'JetBrains Mono',monospace",fontSize:10}}>No history yet — records every minute</td></tr>
             :hist.map((h,i)=>(
               <tr key={i} onMouseEnter={e=>e.currentTarget.style.background="rgba(255,255,255,.015)"}
                 onMouseLeave={e=>e.currentTarget.style.background=""}>
@@ -63,6 +65,10 @@ export default function History(){
                     color:h.zone==="CALL"?"#00e676":h.zone==="PUT"?"#ff3d5a":"#ffc94d"}}>{h.zone}</span>
                 </td>
                 <Td v={h.change} c={h.change>=0?"#00e676":"#ff3d5a"}/>
+                <td style={{padding:"7px 10px",textAlign:"right",borderBottom:"1px solid rgba(22,32,51,.4)",fontFamily:"'JetBrains Mono',monospace",
+                  color:(h.different!=null&&h.different!==0)?((-h.different)<0?"#ff3d5a":"#00e676"):"#4a5568"}}>
+                  {(h.different==null||isNaN(h.different)||h.different===0)?"—":(-h.different).toFixed(4)}
+                </td>
                 <Td v={h.ce_strike} d={0}/><Td v={h.pe_strike} d={0}/>
               </tr>
             ))}
