@@ -357,17 +357,22 @@ class LOCEngine:
 
         # MCX options are illiquid at ITM-2 — fall back to nearest strike
         # with non-zero LTP so the LOC engine has real data to work with.
+        # Only jump to a different strike when BOTH ltp AND close are zero.
+        # If close > 0 (prev-day settlement), the ITM-2 strike is valid and
+        # we must not replace pe_strike with a different strike in the history.
         if strikes:
-            ce_ltp = float((ce_row.get("CE") or {}).get("ltp", 0) or 0)
-            if ce_ltp == 0:
+            ce_ltp   = float((ce_row.get("CE") or {}).get("ltp",   0) or 0)
+            ce_close = float((ce_row.get("CE") or {}).get("close", 0) or 0)
+            if ce_ltp == 0 and ce_close == 0:
                 for s in sorted(strikes, key=lambda x: abs(x - st.ce_strike)):
                     row = st.option_chain.get(s, {})
                     if float((row.get("CE") or {}).get("ltp", 0) or 0) > 0:
                         ce_row = row
                         st.ce_strike = s
                         break
-            pe_ltp = float((pe_row.get("PE") or {}).get("ltp", 0) or 0)
-            if pe_ltp == 0:
+            pe_ltp   = float((pe_row.get("PE") or {}).get("ltp",   0) or 0)
+            pe_close = float((pe_row.get("PE") or {}).get("close", 0) or 0)
+            if pe_ltp == 0 and pe_close == 0:
                 for s in sorted(strikes, key=lambda x: abs(x - st.pe_strike)):
                     row = st.option_chain.get(s, {})
                     if float((row.get("PE") or {}).get("ltp", 0) or 0) > 0:
