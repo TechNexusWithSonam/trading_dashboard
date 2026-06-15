@@ -914,12 +914,19 @@ def _align_mcx_spot_to_options() -> list:
             continue
         if (yr, mo) == (today_d.year, today_d.month):
             continue  # default option is in the current calendar month
-        # Use API-confirmed option underlying when available — it correctly maps
-        # options to their actual parent futures (e.g. SILVER Jun options live on
-        # Jul futures, so we must NOT roll spot to a non-existent Jun futures key).
-        # Fall back to month-based resolution only when underlying is unknown.
+        # Resolve the futures key for the SPECIFIC option expiry month.
+        # _mcx_option_underlying is set once at startup from validate_mcx_keys()
+        # and points to whichever month's futures had option contracts at boot time.
+        # When the option default has already rolled to the next month (e.g. July)
+        # but _mcx_option_underlying still holds the prior month's key (June),
+        # using opt_underlying produces new_spot == old_spot → alignment silently
+        # skips, leaving spot on June while options are fetched for July.
+        # Fix: derive new_spot from the option expiry month first, fall back to
+        # opt_underlying only when month-specific resolution fails (covers SILVER
+        # where Jun options live on Jul futures and Jun futures don't exist).
+        month_key = _instruments_mod._mcx_underlying_for_expiry(sym, defx)
         opt_underlying = _instruments_mod._mcx_option_underlying.get(sym) or ""
-        new_spot = opt_underlying if opt_underlying else mcx_key_for_month(sym, yr, mo)
+        new_spot = month_key or mcx_key_for_month(sym, yr, mo) or opt_underlying
         if not new_spot: continue
         old_spot = _instruments_mod._validated_mcx.get(sym) or SPOT_KEYS_D.get(sym)
         if old_spot == new_spot:
