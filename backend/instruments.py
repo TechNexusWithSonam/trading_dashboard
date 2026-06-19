@@ -298,14 +298,18 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                         fallback_filtered = nearest_cts
                         fallback_expiry   = nearest
                         fallback_key      = ikey
-                        # Close enough — stop searching early to save API calls.
-                        # ≤7 days: small date mismatch (NaturalGas / Crude).
+                        # Stop early only when the date mismatch is within tolerance:
+                        # ≤7 days: NaturalGas/CrudeOil — small MCX date mismatches only.
+                        #          A 31-day gap (June→July) must NOT be accepted; that
+                        #          would load the wrong month's contracts entirely.
                         # ≤45 days: GOLD/SILVER/COPPER delivery-month convention —
-                        # expiry list returns last day of delivery month (e.g.
-                        # 2026-08-31) but option contracts expire early that month
-                        # (~Aug 4). The gap can be 25-30 days; 45 covers it safely.
+                        #          expiry list returns last day of delivery month (e.g.
+                        #          2026-08-31) but option contracts expire early that month
+                        #          (~Aug 4). Gap can be 25-30 days; 45 covers it safely.
+                        _MONTHLY_TIGHT = {"CRUDEOIL", "NATURALGAS"}
+                        max_gap = 7 if sym_upper in _MONTHLY_TIGHT else 45
                         gap = abs((date.fromisoformat(nearest) - date.fromisoformat(expiry)).days)
-                        if gap <= 45:
+                        if gap <= max_gap:
                             break
                 await asyncio.sleep(0.15)
             if not filtered:
@@ -1042,22 +1046,28 @@ async def validate_mcx_keys(token: str) -> dict:
                   f"(spot={spot_key}, options_on={underlying})")
     if detected_next_month:
         _MCX_NEXT_MONTH_OPTION_SYMBOLS.update(detected_next_month)
-    # Remove symbols where API confirmed same-month convention — but NEVER remove
-    # seeded symbols (_MCX_NEXT_MONTH_SEED). The seed represents stable MCX exchange
-    # rules that don't change. API evidence could be wrong during rollover windows
-    # (expired contracts still returned, or new-month contracts not yet published).
+    # Remove symbols where LIVE (non-expired) contracts confirmed same-month convention.
+    # The expired-contract filter above means only genuine same-month evidence reaches here.
+    # The NaturalGas convention is NOT always "next-month" — it depends on whether the
+    # same-month futures expire before or after the options in that specific month:
+    #   June 2026: JUNFUT expires Jun 25, June options expire Jun 23 → options CAN be
+    #              on JUNFUT (same-month); live JUNFUT contracts confirm this.
+    #   July 2026: JULFUT expires ~Jul 18, July options expire Jul 24 → options MUST be
+    #              on AUGFUT (next-month); JULFUT has no live July contracts.
+    # We trust live-contract evidence here; expired contracts are already filtered out above.
     same_month_confirmed = {
         sym for sym, underlying in _mcx_option_underlying.items()
         if underlying and result.get(sym) and underlying == result[sym]
-        and sym not in _MCX_NEXT_MONTH_SEED
     }
     _MCX_NEXT_MONTH_OPTION_SYMBOLS -= same_month_confirmed
-    # Belt-and-suspenders: always restore the seed regardless of what detection found.
-    # A single wrong API response must not permanently corrupt the convention set
-    # for the lifetime of the process.
-    _MCX_NEXT_MONTH_OPTION_SYMBOLS.update(_MCX_NEXT_MONTH_SEED)
+    # Re-seed any symbol for which we found NO evidence at all (API failure / no contracts
+    # returned). Without this, a completely blank result would leave the set in whatever
+    # state a previous validate_mcx_keys() call left it — possibly wrong.
+    no_evidence = {sym for sym in _MCX_NEXT_MONTH_SEED if sym not in _mcx_option_underlying}
+    _MCX_NEXT_MONTH_OPTION_SYMBOLS.update(no_evidence)
     print(f"[MCX] Next-month option symbols: {_MCX_NEXT_MONTH_OPTION_SYMBOLS} "
-          f"(detected={detected_next_month}, same_month_removed={same_month_confirmed})")
+          f"(detected={detected_next_month}, same_month={same_month_confirmed}, "
+          f"no_evidence_reseeded={no_evidence})")
 
     return result
 
