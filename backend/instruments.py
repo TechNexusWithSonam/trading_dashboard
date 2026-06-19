@@ -181,8 +181,10 @@ async def fetch_expiry_list(symbol: str, token: str) -> list:
 # ── MCX option chain (built from contracts + quotes) ────────────
 def _mcx_underlying_for_expiry(symbol: str, expiry: str) -> str:
     """Pick the MCX futures underlying whose month matches the requested option
-    expiry. MCX options are tied to a specific month's futures contract, so
-    May options live under May futures, June options under June futures, etc.
+    expiry. For most symbols (CrudeOil, Gold, Silver, Copper) options live under
+    the same-month futures. For symbols in _MCX_NEXT_MONTH_OPTION_SYMBOLS
+    (NaturalGas), options are listed under the NEXT month's futures:
+      June options → July futures, July options → August futures, etc.
     Returns "" if the instrument master hasn't been loaded or no match found.
     """
     if not expiry or len(expiry) < 7 or not _mcx_sym_to_key:
@@ -191,8 +193,15 @@ def _mcx_underlying_for_expiry(symbol: str, expiry: str) -> str:
         yr = int(expiry[:4]); mo = int(expiry[5:7])
     except Exception:
         return ""
-    mon_str = f"{str(yr)[2:]}{_M[mo - 1]}"   # e.g. "26MAY"
-    target = f"{symbol.upper()}{mon_str}FUT"
+    sym_upper = symbol.upper()
+    # NaturalGas and any confirmed next-month-convention symbols: shift one month forward
+    if sym_upper in _MCX_NEXT_MONTH_OPTION_SYMBOLS:
+        mo_adj = mo % 12 + 1
+        yr_adj = yr + (1 if mo == 12 else 0)
+    else:
+        mo_adj, yr_adj = mo, yr
+    mon_str = f"{str(yr_adj)[2:]}{_M[mo_adj - 1]}"   # e.g. "26JUL" for NaturalGas June expiry
+    target = f"{sym_upper}{mon_str}FUT"
     if target in _mcx_sym_to_key:
         return _mcx_sym_to_key[target]
     return ""
@@ -875,6 +884,15 @@ def _resolve_mcx_key(sym: str, months_ahead: int) -> str:
 # MCX option underlying keys (may differ from spot futures key)
 _mcx_option_underlying: dict = {}   # sym → instrument_key for option chain
 
+# Stable MCX exchange conventions: options for these symbols are listed under
+# the NEXT month's futures (e.g. NaturalGas June options → July futures).
+# This is a known, stable broker rule — it does NOT change month-to-month.
+# _MCX_NEXT_MONTH_SEED is the immutable ground-truth; validate_mcx_keys()
+# may add symbols but must never remove seeded ones (API evidence can be
+# misleading when expired contracts are still returned by the broker).
+_MCX_NEXT_MONTH_SEED: frozenset = frozenset({"NATURALGAS"})
+_MCX_NEXT_MONTH_OPTION_SYMBOLS: set = set(_MCX_NEXT_MONTH_SEED)
+
 async def validate_mcx_keys(token: str) -> dict:
     """Find correct MCX instrument keys from the instrument master."""
     global _validated_mcx, _mcx_option_underlying
@@ -909,12 +927,16 @@ async def validate_mcx_keys(token: str) -> dict:
                     return date(2099, 1, 1)
 
             candidates.sort(key=lambda x: _parse_expiry(x[0]))
-            # Pick the nearest future that hasn't expired
+            # Pick the nearest futures whose calendar month is >= current month.
+            # Using first-of-month comparison: even if this month's futures
+            # expired mid-month, _align_mcx_spot_to_options() will advance the
+            # spot to next month once expiry_cache shows the option default has
+            # rolled forward. This is intentional — we want the closest anchor.
             for tsym, ikey in candidates:
                 exp_approx = _parse_expiry(tsym)
                 if exp_approx >= today.replace(day=1):
                     result[sym] = ikey
-                    print(f"[MCX] {sym} = {ikey} ({tsym})")
+                    print(f"[MCX] validate: {sym} = {ikey} ({tsym}), today={today}")
                     found = True
                     break
 
@@ -933,7 +955,15 @@ async def validate_mcx_keys(token: str) -> dict:
     _validated_mcx = result
 
     # Find option underlying keys (may differ from spot futures for some commodities)
+    # IMPORTANT: filter to LIVE contracts only (expiry >= today). The Upstox API
+    # returns expired contracts for a futures key even after they have settled.
+    # Counting expired contracts as evidence would wrongly set _mcx_option_underlying
+    # to the current spot key (e.g. JULFUT in July) when the true underlying for
+    # the active options is the NEXT month's key (e.g. AUGFUT) — this would cause
+    # NATURALGAS to be removed from _MCX_NEXT_MONTH_OPTION_SYMBOLS and result in
+    # wrong spot alignment and incorrect BOP/LOC ratios after each monthly rollover.
     if token:
+        today_str = today.isoformat()
         for sym in result:
             spot_key = result[sym]
             try:
@@ -943,11 +973,18 @@ async def validate_mcx_keys(token: str) -> dict:
                                     headers=_h(token))
                     if r.status_code == 200:
                         contracts = r.json().get("data", [])
-                        if contracts:
+                        # Only count non-expired option contracts as evidence
+                        live = [ct for ct in contracts
+                                if isinstance(ct, dict) and (ct.get("expiry") or "") >= today_str]
+                        if live:
                             _mcx_option_underlying[sym] = spot_key
-                            print(f"[MCX] {sym} options on {spot_key}: {len(contracts)} contracts")
+                            print(f"[MCX] {sym} options on {spot_key}: {len(live)} live contracts "
+                                  f"({len(contracts)-len(live)} expired ignored)")
                             continue
-                # If spot key has no contracts, try other futures for this symbol
+                        elif contracts:
+                            print(f"[MCX] {sym} spot_key={spot_key} has {len(contracts)} contracts "
+                                  f"but ALL expired — searching other futures")
+                # If spot key has no live contracts, try other futures for this symbol
                 candidates = []
                 for tsym, ikey in _mcx_sym_to_key.items():
                     if tsym.startswith(sym) and tsym.endswith("FUT"):
@@ -958,12 +995,16 @@ async def validate_mcx_keys(token: str) -> dict:
                             continue
                         if ikey != spot_key:
                             candidates.append((tsym, ikey))
-                # Sort by expiry proximity
+                # Sort by expiry proximity; prefer future months over expired ones
                 def _parse_exp(tsym):
                     s = tsym[len(sym):]
                     try: return date(int("20" + s[:2]), _M.index(s[2:5]) + 1, 1)
                     except: return date(2099, 1, 1)
-                candidates.sort(key=lambda x: _parse_exp(x[0]))
+                today_month = today.replace(day=1)
+                candidates.sort(key=lambda x: (
+                    0 if _parse_exp(x[0]) >= today_month else 1,
+                    _parse_exp(x[0])
+                ))
                 for tsym, ikey in candidates:
                     try:
                         async with httpx.AsyncClient(timeout=10) as c:
@@ -972,9 +1013,13 @@ async def validate_mcx_keys(token: str) -> dict:
                                             headers=_h(token))
                             if r.status_code == 200:
                                 contracts = r.json().get("data", [])
-                                if contracts:
+                                # Same filter: only live contracts count as evidence
+                                live = [ct for ct in contracts
+                                        if isinstance(ct, dict) and (ct.get("expiry") or "") >= today_str]
+                                if live:
                                     _mcx_option_underlying[sym] = ikey
-                                    print(f"[MCX] {sym} options on {ikey} ({tsym}): {len(contracts)} contracts")
+                                    print(f"[MCX] {sym} options on {ikey} ({tsym}): "
+                                          f"{len(live)} live contracts")
                                     break
                     except:
                         pass
@@ -983,7 +1028,109 @@ async def validate_mcx_keys(token: str) -> dict:
                 print(f"[MCX] {sym} option key search: {e}")
             await asyncio.sleep(0.2)
 
+    # Determine which symbols use next-month convention (options listed under
+    # the following month's futures). Confirmed by comparing the resolved spot
+    # key with the option underlying key — if they differ, options trade on a
+    # different (typically next) month's futures contract.
+    global _MCX_NEXT_MONTH_OPTION_SYMBOLS
+    detected_next_month = set()
+    for sym, underlying in _mcx_option_underlying.items():
+        spot_key = result.get(sym, "")
+        if underlying and spot_key and underlying != spot_key:
+            detected_next_month.add(sym)
+            print(f"[MCX] {sym}: next-month option convention confirmed "
+                  f"(spot={spot_key}, options_on={underlying})")
+    if detected_next_month:
+        _MCX_NEXT_MONTH_OPTION_SYMBOLS.update(detected_next_month)
+    # Remove symbols where API confirmed same-month convention — but NEVER remove
+    # seeded symbols (_MCX_NEXT_MONTH_SEED). The seed represents stable MCX exchange
+    # rules that don't change. API evidence could be wrong during rollover windows
+    # (expired contracts still returned, or new-month contracts not yet published).
+    same_month_confirmed = {
+        sym for sym, underlying in _mcx_option_underlying.items()
+        if underlying and result.get(sym) and underlying == result[sym]
+        and sym not in _MCX_NEXT_MONTH_SEED
+    }
+    _MCX_NEXT_MONTH_OPTION_SYMBOLS -= same_month_confirmed
+    # Belt-and-suspenders: always restore the seed regardless of what detection found.
+    # A single wrong API response must not permanently corrupt the convention set
+    # for the lifetime of the process.
+    _MCX_NEXT_MONTH_OPTION_SYMBOLS.update(_MCX_NEXT_MONTH_SEED)
+    print(f"[MCX] Next-month option symbols: {_MCX_NEXT_MONTH_OPTION_SYMBOLS} "
+          f"(detected={detected_next_month}, same_month_removed={same_month_confirmed})")
+
     return result
+
+
+async def refresh_mcx_option_underlying(token: str, spot_keys: dict) -> None:
+    """Lightweight post-rollover refresh of _mcx_option_underlying.
+
+    After a monthly rollover the spot futures key changes (e.g. CRUDEOIL moves
+    from JUNFUT to JULFUT). _mcx_option_underlying was set at startup and now
+    points to the old month's futures, making _fetch_mcx_option_chain() try
+    the wrong canonical underlying first.
+
+    This re-queries only the current active spot keys (already resolved and
+    passed in as `spot_keys`) and updates _mcx_option_underlying in place.
+    It does NOT touch _MCX_NEXT_MONTH_OPTION_SYMBOLS — that is protected by
+    the seed and only mutated by validate_mcx_keys().
+    """
+    global _mcx_option_underlying
+    if not token or not _mcx_sym_to_key:
+        return
+    today_str = date.today().isoformat()
+    for sym, spot_key in spot_keys.items():
+        if not spot_key or not spot_key.startswith("MCX"):
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.get(UPSTOX_CONTRACTS,
+                                params={"instrument_key": spot_key},
+                                headers=_h(token))
+                if r.status_code == 200:
+                    contracts = r.json().get("data", [])
+                    live = [ct for ct in contracts
+                            if isinstance(ct, dict) and (ct.get("expiry") or "") >= today_str]
+                    if live:
+                        _mcx_option_underlying[sym] = spot_key
+                        print(f"[MCX Refresh] {sym} underlying updated → {spot_key} "
+                              f"({len(live)} live contracts)")
+                        continue
+                # Spot key has no live contracts — search other futures
+                today_month = date.today().replace(day=1)
+                candidates = sorted(
+                    [(tsym, ikey) for tsym, ikey in _mcx_sym_to_key.items()
+                     if (tsym.startswith(sym) and tsym.endswith("FUT")
+                         and ikey != spot_key
+                         and not (tsym[len(sym):][0:1] == "M" and tsym[len(sym):][1:2].isdigit())
+                         and not any(v in tsym for v in ["PETAL", "GUINEA", "TEN", "MIC"]))],
+                    key=lambda x: (
+                        0 if date(int("20"+x[0][len(sym):len(sym)+2]),
+                                  _M.index(x[0][len(sym)+2:len(sym)+5])+1, 1) >= today_month else 1,
+                        x[0]
+                    )
+                )
+                for tsym, ikey in candidates[:4]:
+                    try:
+                        async with httpx.AsyncClient(timeout=10) as c2:
+                            r2 = await c2.get(UPSTOX_CONTRACTS,
+                                              params={"instrument_key": ikey},
+                                              headers=_h(token))
+                            if r2.status_code == 200:
+                                cts = r2.json().get("data", [])
+                                live2 = [ct for ct in cts
+                                         if isinstance(ct, dict) and (ct.get("expiry") or "") >= today_str]
+                                if live2:
+                                    _mcx_option_underlying[sym] = ikey
+                                    print(f"[MCX Refresh] {sym} underlying updated → {ikey} "
+                                          f"({tsym}, {len(live2)} live contracts)")
+                                    break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.15)
+        except Exception as e:
+            print(f"[MCX Refresh] {sym} error: {e}")
+        await asyncio.sleep(0.2)
 
 
 async def fetch_intraday_candles(key: str, token: str,

@@ -44,7 +44,8 @@ from .instruments import (
     fetch_option_ohlc_rest, fetch_intraday_candles,
     validate_mcx_keys, calculate_expiries_fallback,
     normalize_mcx_response_key, normalize_response_key,
-    refresh_nse_eq_keys, STRIKE_STEPS, MONTHLY_SYMBOLS, _is_past_market_close_ist
+    refresh_nse_eq_keys, refresh_mcx_option_underlying,
+    STRIKE_STEPS, MONTHLY_SYMBOLS, _is_past_market_close_ist
 )
 from . import instruments as _instruments_mod
 from . import instrument_keys as _ik
@@ -401,6 +402,10 @@ def _route_tick(key, ltp, cp, o, h, l, ts):
     if not ltp: return
     sym = FEED_KEY_TO_SYM.get(key)
     if sym and sym in LOC_SYMBOLS_SET:
+        # Sanity-check: log when an MCX key routes to a symbol but the key no
+        # longer matches SPOT_KEYS_D (indicates a stale FEED_KEY_TO_SYM entry).
+        if key.startswith("MCX_FO|") and SPOT_KEYS_D.get(sym) and SPOT_KEYS_D[sym] != key:
+            print(f"[MCX Warn] Stale route: key={key} → {sym} but SPOT_KEYS_D has {SPOT_KEYS_D[sym]}")
         loc_engine.update_spot(sym, ltp, cp, h, l, ts, o)
         return
     # ── LOC option routing ─────────────────────────────────────────
@@ -903,6 +908,8 @@ def _align_mcx_spot_to_options() -> list:
     global COMMODITY_KEYS
     from datetime import date as _dc
     today_d = _dc.today()
+    print(f"[MCX Align] Running: today={today_d}, "
+          f"next_month_syms={_instruments_mod._MCX_NEXT_MONTH_OPTION_SYMBOLS}")
     rolled = []
     for sym in _MCX_LOC:
         info = state.expiry_cache.get(sym) or {}
@@ -915,29 +922,31 @@ def _align_mcx_spot_to_options() -> list:
         opt_underlying = _instruments_mod._mcx_option_underlying.get(sym) or ""
         if (yr, mo) == (today_d.year, today_d.month):
             # Same calendar month: normally no realignment needed.
-            # Exception: NaturalGas (and potentially others) list their options
-            # under the NEXT month's futures, so _mcx_option_underlying differs
-            # from the current spot (e.g. June options → July futures).
-            # If the option underlying key differs from validated spot, realign.
+            # Exception: NaturalGas and other next-month-convention symbols list
+            # their options under the NEXT month's futures. Use
+            # _mcx_underlying_for_expiry() (which knows about _MCX_NEXT_MONTH_OPTION_SYMBOLS)
+            # rather than _mcx_option_underlying (which is set once at startup and
+            # becomes stale after each monthly rollover without a restart).
             cur_spot = _instruments_mod._validated_mcx.get(sym) or SPOT_KEYS_D.get(sym) or ""
-            if not opt_underlying or opt_underlying == cur_spot:
+            correct_spot = _instruments_mod._mcx_underlying_for_expiry(sym, defx)
+            if not correct_spot:
+                # Fall back to startup-detected underlying only when month-resolution fails
+                correct_spot = opt_underlying
+            if not correct_spot or correct_spot == cur_spot:
                 continue
-            # Use the option underlying directly — it's the correct futures for
-            # this expiry (e.g. July futures for NaturalGas June options).
-            new_spot = opt_underlying
+            new_spot = correct_spot
+            print(f"[MCX Align] {sym}: same-month branch realigning "
+                  f"{cur_spot} → {new_spot} (expiry={defx})")
         else:
             # Resolve the futures key for the SPECIFIC option expiry month.
-            # _mcx_option_underlying is set once at startup from validate_mcx_keys()
-            # and points to whichever month's futures had option contracts at boot time.
-            # When the option default has already rolled to the next month (e.g. July)
-            # but _mcx_option_underlying still holds the prior month's key (June),
-            # using opt_underlying produces new_spot == old_spot → alignment silently
-            # skips, leaving spot on June while options are fetched for July.
-            # Fix: derive new_spot from the option expiry month first, fall back to
-            # opt_underlying only when month-specific resolution fails (covers SILVER
-            # where Jun options live on Jul futures and Jun futures don't exist).
+            # _mcx_underlying_for_expiry() is aware of _MCX_NEXT_MONTH_OPTION_SYMBOLS:
+            #   CrudeOil/Gold/Silver/Copper: July options → July futures (same month)
+            #   NaturalGas: July options → August futures (next month convention)
+            # Falls back to mcx_key_for_month() (name-based) then opt_underlying.
             month_key = _instruments_mod._mcx_underlying_for_expiry(sym, defx)
             new_spot = month_key or mcx_key_for_month(sym, yr, mo) or opt_underlying
+            print(f"[MCX Align] {sym}: diff-month branch expiry={defx} "
+                  f"month_key={month_key or 'MISS'} → new_spot={new_spot or 'NONE'}")
         if not new_spot: continue
         old_spot = _instruments_mod._validated_mcx.get(sym) or SPOT_KEYS_D.get(sym)
         if old_spot == new_spot:
@@ -1192,6 +1201,17 @@ async def _daily_rollover_check():
 
     mcx_spot_rolled = _align_mcx_spot_to_options()
     await _prime_mcx_spot_from_rest()
+
+    # After spot alignment, refresh _mcx_option_underlying so chain fetches
+    # use the correct new-month underlying (e.g. AUGFUT after NaturalGas rolls
+    # from June to July). Without this, _fetch_mcx_option_chain() still tries
+    # the old startup-derived underlying first and may use a stale canonical key.
+    if mcx_spot_rolled and state.access_token:
+        mcx_spot_keys = {sym: SPOT_KEYS_D[sym] for sym in _MCX_LOC if sym in SPOT_KEYS_D}
+        try:
+            await refresh_mcx_option_underlying(state.access_token, mcx_spot_keys)
+        except Exception as e:
+            print(f"[Rollover] refresh_mcx_option_underlying error: {e}")
 
     # Chain refresh set: union of expiry-rolled and MCX-spot-rolled
     chain_refresh = {sym: new_def for sym, _o, new_def in priority_rolled}
