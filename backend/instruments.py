@@ -1198,7 +1198,7 @@ def get_current_and_next_expiry(expiries: list, symbol: str) -> dict:
     # forward. Prior to the expiry date, today's expiry IS in `active`.
     # No near_cutoff buffer — the old +3-day cutoff caused premature switches
     # (e.g. NIFTY showed next-week options from Monday for a Thursday expiry).
-    active = [e for e in future if e > today_s] or future
+    active = [e for e in future if e >= today_s] or future
 
     # Post-market intraday rollover: after NSE market close (15:35 IST) on
     # the expiry day itself, advance `future` to skip the settled contract so
