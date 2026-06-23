@@ -353,9 +353,11 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
             # live on Oct futures, so `option_key` is the correct
             # underlying even though it differs from the global spot_key.
             spot_from_quote = 0.0
+            # Upstox quote API needs name-based key for MCX; numeric keys return empty
+            _opt_name_key = _mcx_numeric_to_name.get(option_key, option_key)
             for attempt in range(2):
                 r2 = await c.get(UPSTOX_QUOTE_V2,
-                                 params={"instrument_key": option_key},
+                                 params={"instrument_key": _opt_name_key},
                                  headers=_h(token))
                 if r2.status_code == 200:
                     for _, v in (r2.json().get("data", {}) or {}).items():
@@ -387,10 +389,18 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
             hi = min(len(sorted_strikes), atm_idx + 11)
             nearby_strikes = sorted_strikes[lo:hi]
 
+            # MCX quote API returns empty for numeric keys; use name-based keys
+            _qkey_to_ikey = {}
             quote_keys = []
             for s in nearby_strikes:
-                if "CE" in strike_map[s]: quote_keys.append(strike_map[s]["CE"])
-                if "PE" in strike_map[s]: quote_keys.append(strike_map[s]["PE"])
+                for _sd in ("CE", "PE"):
+                    if _sd not in strike_map[s]: continue
+                    _ik = strike_map[s][_sd]
+                    _ts = key_to_tsym.get(_ik, "")
+                    _nk = f"MCX_FO|{_ts}" if _ts else _ik
+                    if _nk not in quote_keys:
+                        quote_keys.append(_nk)
+                    _qkey_to_ikey[_nk] = _ik
 
             # Step 5: Fetch quotes in chunks
             # MCX API returns name-based keys (MCX_FO:CRUDEOIL26APR9450CE)
@@ -432,6 +442,11 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                         print(f"[MCXChain] Quote chunk {i//25+1} HTTP {r3.status_code}")
                         break
                 await asyncio.sleep(0.3)
+
+            # Back-map name-based quote keys → numeric keys for chain building
+            for _nk, _ik in _qkey_to_ikey.items():
+                if _nk in quotes and _ik not in quotes:
+                    quotes[_ik] = quotes[_nk]
 
             # Step 6: Build chain dict
             # Note: ohlc.close = today's close (= LTP during trading), NOT previous day's close.
