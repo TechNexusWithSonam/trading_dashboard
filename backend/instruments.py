@@ -1222,10 +1222,10 @@ def get_current_and_next_expiry(expiries: list, symbol: str) -> dict:
         # all liquidity on their final day (settlement at noon/afternoon). A
         # 1-day buffer ensures the system switches to the next live monthly
         # contract one day early (e.g. GOLD May 27 → June 30 on May 26).
-        tomorrow = (today + timedelta(days=1)).isoformat()
-        ref_no_near = [e for e in ref if e > tomorrow]
-        if ref_no_near:
-            ref = ref_no_near
+        # No early-rollover buffer: stay on current options until they expire.
+        # The old 1-day buffer caused premature rollover the day before options
+        # expiry, which combined with the 1-2 day options-to-futures gap meant
+        # CRUDEOIL/NATURALGAS/COPPER rolled 2-3 days before FUTURES expiry.
         months_order = []
         for e in ref:
             ym = e[:7]
