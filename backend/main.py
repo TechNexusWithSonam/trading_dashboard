@@ -394,6 +394,7 @@ def _record_loc_hist(sym, loc):
     hist = state.loc_history.setdefault(sym, [])
     keep = ["ltp","bop","cep","pep","ul","ll","ful","fll","ful_diff","fll_diff",
             "zone","change","direction","different",
+            "call_cp_diff","put_cp_diff",
             "ce_strike","pe_strike","ce_ltp","pe_ltp","ce_iv","pe_iv"]
     hist.insert(0, {"ts":int(time.time()*1000), **{k:loc[k] for k in keep if k in loc}})
     if len(hist) > 60: hist.pop()
@@ -939,20 +940,6 @@ def _align_mcx_spot_to_options() -> list:
             print(f"[MCX Align] {sym}: same-month branch realigning "
                   f"{cur_spot} → {new_spot} (expiry={defx})")
         else:
-            # Before rolling: verify the current futures has actually expired by
-            # checking the instrument master. Upstox removes expired contracts
-            # from the master quickly after settlement. If the current key is
-            # still listed, defer the roll — options may have moved to next month
-            # while the futures contract is still live (e.g. COPPER June options
-            # expire Jun 2-5 but COPPER26JUNFUT trades until Jun 29).
-            cur_spot_pre = _instruments_mod._validated_mcx.get(sym) or SPOT_KEYS_D.get(sym) or ""
-            if cur_spot_pre and _instruments_mod._mcx_sym_to_key:
-                cur_name_pre = _instruments_mod._mcx_numeric_to_name.get(cur_spot_pre, cur_spot_pre)
-                cur_tsym_pre = cur_name_pre.split("|", 1)[1] if "|" in cur_name_pre else cur_name_pre
-                if cur_tsym_pre and cur_tsym_pre in _instruments_mod._mcx_sym_to_key:
-                    print(f"[MCX Align] {sym}: deferring roll — {cur_tsym_pre} still in instrument master")
-                    continue
-
             # Resolve the futures key for the SPECIFIC option expiry month.
             # _mcx_underlying_for_expiry() is aware of _MCX_NEXT_MONTH_OPTION_SYMBOLS:
             #   CrudeOil/Gold/Silver/Copper: July options → July futures (same month)
@@ -1250,7 +1237,6 @@ async def _daily_rollover_check():
     priority = _INDEX_LOC + _MCX_LOC
     priority_rolled = await _process_expiry_rollovers(priority, parallel=False)
 
-    await _instruments_mod._load_mcx_instrument_master()
     mcx_spot_rolled = _align_mcx_spot_to_options()
     _update_mcx_spot_months()
     await _prime_mcx_spot_from_rest()
