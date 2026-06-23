@@ -397,7 +397,7 @@ def _record_loc_hist(sym, loc):
             "call_cp_diff","put_cp_diff",
             "ce_strike","pe_strike","ce_ltp","pe_ltp","ce_iv","pe_iv"]
     hist.insert(0, {"ts":int(time.time()*1000), **{k:loc[k] for k in keep if k in loc}})
-    if len(hist) > 60: hist.pop()
+    if len(hist) > 200: hist.pop()
 
 def _route_tick(key, ltp, cp, o, h, l, ts):
     if not ltp: return
