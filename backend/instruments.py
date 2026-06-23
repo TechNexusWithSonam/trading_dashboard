@@ -515,7 +515,25 @@ async def fetch_option_chain(symbol: str, expiry: str, token: str) -> dict:
 
     # MCX uses contract-based chain building (option/chain API doesn't support MCX)
     if spot_key.startswith("MCX"):
-        return await _fetch_mcx_option_chain(symbol, expiry, token)
+        from datetime import date as _d
+        chain = await _fetch_mcx_option_chain(symbol, expiry, token)
+        # If all LTPs are zero on expiry day the contract has settled.
+        # Fall back to the next available expiry so LOC keeps showing data.
+        if chain and expiry == _d.today().isoformat():
+            if not any(v.get("CE", {}).get("ltp") for v in chain.values()):
+                try:
+                    import sys as _sys
+                    _main = _sys.modules.get("backend.main")
+                    if _main:
+                        all_exp = (getattr(_main, "state", None) and
+                                   _main.state.expiry_cache.get(symbol.upper(), {}).get("all")) or []
+                        next_exp = next((e for e in sorted(all_exp) if e > expiry), None)
+                        if next_exp:
+                            print(f"[MCXChain] {symbol}: {expiry} settled, falling back to {next_exp}")
+                            chain = await _fetch_mcx_option_chain(symbol, next_exp, token)
+                except Exception:
+                    pass
+        return chain
 
     try:
         async with httpx.AsyncClient(timeout=20) as c:
