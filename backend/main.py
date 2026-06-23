@@ -539,6 +539,7 @@ async def startup_init():
     # month's options are actually live (info["default"]).
     global _last_rollover_check_date
     rolled_init = _align_mcx_spot_to_options()
+    _update_mcx_spot_months()
     from datetime import date as _dc_init
     _last_rollover_check_date = _dc_init.today()
 
@@ -1005,6 +1006,29 @@ def _align_mcx_spot_to_options() -> list:
     return rolled
 
 
+
+def _update_mcx_spot_months():
+    from .instruments import _mcx_numeric_to_name, _M
+    for sym in _MCX_LOC:
+        spot_key = SPOT_KEYS_D.get(sym, "")
+        if not spot_key or not spot_key.startswith("MCX"):
+            continue
+        name_key = _mcx_numeric_to_name.get(spot_key, spot_key)
+        trading_sym = name_key.split("|", 1)[1] if "|" in name_key else name_key
+        suffix = trading_sym[len(sym):]
+        if len(suffix) < 5:
+            continue
+        try:
+            yr = int("20" + suffix[:2])
+            mon_code = suffix[2:5].upper()
+            mon = _M.index(mon_code) + 1
+            spot_month = f"{yr:04d}-{mon:02d}"
+            if sym not in state.expiry_cache:
+                state.expiry_cache[sym] = {}
+            state.expiry_cache[sym]["spot_month"] = spot_month
+        except (ValueError, IndexError):
+            pass
+
 _last_rollover_check_date = None  # set on first periodic tick
 
 
@@ -1200,6 +1224,7 @@ async def _daily_rollover_check():
     priority_rolled = await _process_expiry_rollovers(priority, parallel=False)
 
     mcx_spot_rolled = _align_mcx_spot_to_options()
+    _update_mcx_spot_months()
     await _prime_mcx_spot_from_rest()
 
     # After spot alignment, refresh _mcx_option_underlying so chain fetches
