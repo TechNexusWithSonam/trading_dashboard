@@ -393,6 +393,7 @@ def _record_loc_hist(sym, loc):
     state.loc_hist_ts[sym] = now
     hist = state.loc_history.setdefault(sym, [])
     keep = ["ltp","bop","cep","pep","ul","ll","ful","fll","ful_diff","fll_diff",
+            "call_cp_diff","put_cp_diff",
             "zone","change","direction","different",
             "call_cp_diff","put_cp_diff",
             "ce_strike","pe_strike","ce_ltp","pe_ltp","ce_iv","pe_iv"]
@@ -540,6 +541,7 @@ async def startup_init():
     # month's options are actually live (info["default"]).
     global _last_rollover_check_date
     rolled_init = _align_mcx_spot_to_options()
+    _update_mcx_spot_months()
     from datetime import date as _dc_init
     _last_rollover_check_date = _dc_init.today()
 
@@ -1007,41 +1009,34 @@ def _align_mcx_spot_to_options() -> list:
     return rolled
 
 
-
 def _update_mcx_spot_months():
-    from .instruments import _mcx_sym_to_key, _M
-    from datetime import date as _dc3
-    today_month = _dc3.today().replace(day=1)
+    """Stamp spot_month (YYYY-MM) onto each MCX symbol's expiry_cache entry.
+    Derived from the current validated spot key's trading symbol so the
+    frontend can display the FUTURES contract month (e.g. Jun 2026) even
+    when the options expiry has already rolled to the next month.
+    """
+    from .instruments import _mcx_numeric_to_name, _M
     for sym in _MCX_LOC:
-        candidates = []
-        for tsym in list(_mcx_sym_to_key.keys()):
-            if not tsym.startswith(sym) or not tsym.endswith("FUT"):
-                continue
-            suffix = tsym[len(sym):]
-            if len(suffix) < 5:
-                continue
-            if suffix[0] == "M" and suffix[1].isdigit():
-                continue
-            if any(v in tsym for v in ["PETAL", "GUINEA", "TEN", "MIC"]):
-                continue
-            try:
-                yr = int("20" + suffix[:2])
-                mo = _M.index(suffix[2:5].upper()) + 1
-                from datetime import date as _dc4
-                exp_approx = _dc4(yr, mo, 1)
-                if exp_approx >= today_month:
-                    candidates.append((exp_approx, yr, mo))
-            except (ValueError, IndexError):
-                continue
-        if not candidates:
+        spot_key = SPOT_KEYS_D.get(sym, "")
+        if not spot_key or not spot_key.startswith("MCX"):
             continue
-        candidates.sort()
-        _, yr, mo = candidates[0]
-        spot_month = f"{yr:04d}-{mo:02d}"
-        if sym not in state.expiry_cache:
-            state.expiry_cache[sym] = {}
-        state.expiry_cache[sym]["spot_month"] = spot_month
-        print(f"[SpotMonth] {sym} -> {spot_month}")
+        # Resolve numeric key → name-based key (e.g. "MCX_FO|COPPER26JUNFUT")
+        name_key = _mcx_numeric_to_name.get(spot_key, spot_key)
+        trading_sym = name_key.split("|", 1)[1] if "|" in name_key else name_key
+        # Strip base symbol prefix: "COPPER26JUNFUT" → suffix "26JUNFUT"
+        suffix = trading_sym[len(sym):]
+        if len(suffix) < 5:
+            continue
+        try:
+            yr = int("20" + suffix[:2])
+            mon_code = suffix[2:5].upper()
+            mon = _M.index(mon_code) + 1
+            spot_month = f"{yr:04d}-{mon:02d}"
+            if sym not in state.expiry_cache:
+                state.expiry_cache[sym] = {}
+            state.expiry_cache[sym]["spot_month"] = spot_month
+        except (ValueError, IndexError):
+            pass
 
 _last_rollover_check_date = None  # set on first periodic tick
 
