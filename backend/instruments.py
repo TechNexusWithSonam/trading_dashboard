@@ -531,11 +531,6 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                 print(f"[MCXChain] {symbol}/{expiry}: {len(chain)} strikes, "
                       f"spot={spot_from_quote}, ATM={atm_s}, "
                       f"CE_ltp={atm_ce_ltp}")
-                if atm_ce_ltp == 0 and quotes:
-                    sample = list(quotes.keys())[:4]
-                    print(f"[MCXChain] DEBUG {symbol} quotes keys sample: {sample}")
-                elif atm_ce_ltp == 0:
-                    print(f"[MCXChain] DEBUG {symbol} quotes EMPTY — last_status={getattr(r3,'status_code','?')}" + f" raw={getattr(r3,'text','?')[:200]}")
             return chain
 
     except Exception as e:
