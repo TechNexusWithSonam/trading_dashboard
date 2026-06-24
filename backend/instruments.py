@@ -439,8 +439,9 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
             for i in range(0, len(quote_keys), 25):
                 chunk = quote_keys[i:i+25]
                 async with _quote_chunk_sem:
-                 # Retry on rate limit (429)
-                 for attempt in range(4):
+                  await asyncio.sleep(0.6)  # enforce ≥0.6s gap between any two chunk requests
+                  # Retry on rate limit (429)
+                  for attempt in range(4):
                     r3 = await c.get(UPSTOX_QUOTE_V2,
                                      params={"instrument_key": ",".join(chunk)},
                                      headers=_h(token))
