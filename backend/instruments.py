@@ -416,12 +416,17 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                 for _sd in ("CE", "PE"):
                     if _sd not in strike_map[s]: continue
                     _ik = strike_map[s][_sd]
-                    _ts = key_to_tsym.get(_ik, "")
-                    _nk = f"MCX_FO|{_ts}" if _ts else _ik
+                    # Prefer instrument-master compact format (e.g. COPPER26AUG1275CE)
+                    # over option-chain API spaced format (e.g. COPPER 1315 CE 24 AUG 26)
+                    _nk = _mcx_numeric_to_name.get(_ik, "")
+                    if not _nk:
+                        _ts = key_to_tsym.get(_ik, "")
+                        _nk = f"MCX_FO|{_ts}" if _ts else _ik
                     if _nk not in quote_keys:
                         quote_keys.append(_nk)
                     _qkey_to_ikey[_nk] = _ik
 
+            print(f"[MCXChain] DEBUG {symbol} quote_keys[:3]={quote_keys[:3]}")
             # Step 5: Fetch quotes in chunks
             # MCX API returns name-based keys (MCX_FO:CRUDEOIL26APR9450CE)
             # even when we request numeric keys (MCX_FO|562412).
@@ -430,7 +435,7 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
             for i in range(0, len(quote_keys), 25):
                 chunk = quote_keys[i:i+25]
                 # Retry once on rate limit (429)
-                for attempt in range(2):
+                for attempt in range(4):
                     r3 = await c.get(UPSTOX_QUOTE_V2,
                                      params={"instrument_key": ",".join(chunk)},
                                      headers=_h(token))
@@ -455,9 +460,10 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                                 if val:
                                     quotes[req_key] = val
                         break
-                    elif r3.status_code == 429 and attempt == 0:
-                        print(f"[MCXChain] Rate limited on chunk {i//25+1}, retrying in 1.5s...")
-                        await asyncio.sleep(1.5)
+                    elif r3.status_code == 429 and attempt < 3:
+                        wait = (attempt + 1) * 3
+                        print(f"[MCXChain] Rate limited chunk {i//25+1} attempt {attempt+1}, retrying in {wait}s...")
+                        await asyncio.sleep(wait)
                     else:
                         print(f"[MCXChain] Quote chunk {i//25+1} HTTP {r3.status_code}")
                         break
@@ -526,7 +532,7 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                     sample = list(quotes.keys())[:4]
                     print(f"[MCXChain] DEBUG {symbol} quotes keys sample: {sample}")
                 elif atm_ce_ltp == 0:
-                    print(f"[MCXChain] DEBUG {symbol} quotes dict is EMPTY — API returned no data")
+                    print(f"[MCXChain] DEBUG {symbol} quotes EMPTY — last_status={getattr(r3,'status_code','?')}" + f" raw={getattr(r3,'text','?')[:200]}")
             return chain
 
     except Exception as e:
