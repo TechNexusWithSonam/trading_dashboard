@@ -432,10 +432,15 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
             # even when we request numeric keys (MCX_FO|562412).
             # Use _mcx_numeric_to_name to map between formats.
             quotes = {}
+            global _quote_chunk_sem
+            if _quote_chunk_sem is None:
+                import asyncio as _aio
+                _quote_chunk_sem = _aio.Semaphore(1)
             for i in range(0, len(quote_keys), 25):
                 chunk = quote_keys[i:i+25]
-                # Retry once on rate limit (429)
-                for attempt in range(4):
+                async with _quote_chunk_sem:
+                 # Retry on rate limit (429)
+                 for attempt in range(4):
                     r3 = await c.get(UPSTOX_QUOTE_V2,
                                      params={"instrument_key": ",".join(chunk)},
                                      headers=_h(token))
@@ -840,6 +845,7 @@ _mcx_sym_to_key: dict = {}
 _mcx_name_to_numeric: dict = {}
 # Reverse: numeric key → name-based key for MCX (e.g. "MCX_FO|562412" → "MCX_FO|CRUDEOIL26APR9450CE")
 _mcx_numeric_to_name: dict = {}
+_quote_chunk_sem = None  # initialized lazily
 # NSE_EQ tradingsymbol → instrument_key (e.g. "RELIANCE" → "NSE_EQ|INE002A01018")
 _nse_eq_sym_to_key: dict = {}
 
