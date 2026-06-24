@@ -355,20 +355,22 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
             spot_from_quote = 0.0
             # Upstox quote API needs name-based key for MCX; numeric keys return empty
             _opt_name_key = _mcx_numeric_to_name.get(option_key, option_key)
-            for attempt in range(2):
-                r2 = await c.get(UPSTOX_QUOTE_V2,
-                                 params={"instrument_key": _opt_name_key},
-                                 headers=_h(token))
-                if r2.status_code == 200:
-                    for _, v in (r2.json().get("data", {}) or {}).items():
-                        if v:
-                            spot_from_quote = float(v.get("last_price", 0))
-                            break
-                    break
-                elif r2.status_code == 429 and attempt == 0:
-                    await asyncio.sleep(1.5)
-                else:
-                    break
+            async with _quote_chunk_sem:
+                await asyncio.sleep(0.6)
+                for attempt in range(2):
+                    r2 = await c.get(UPSTOX_QUOTE_V2,
+                                     params={"instrument_key": _opt_name_key},
+                                     headers=_h(token))
+                    if r2.status_code == 200:
+                        for _, v in (r2.json().get("data", {}) or {}).items():
+                            if v:
+                                spot_from_quote = float(v.get("last_price", 0))
+                                break
+                        break
+                    elif r2.status_code == 429 and attempt == 0:
+                        await asyncio.sleep(3)
+                    else:
+                        break
 
             # If API spot fetch failed, fall back to live price from WebSocket state
             if not spot_from_quote:
@@ -432,10 +434,6 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
             # even when we request numeric keys (MCX_FO|562412).
             # Use _mcx_numeric_to_name to map between formats.
             quotes = {}
-            global _quote_chunk_sem
-            if _quote_chunk_sem is None:
-                import asyncio as _aio
-                _quote_chunk_sem = _aio.Semaphore(1)
             for i in range(0, len(quote_keys), 25):
                 chunk = quote_keys[i:i+25]
                 async with _quote_chunk_sem:
@@ -779,17 +777,19 @@ async def fetch_option_ohlc_rest(ce_key: str, pe_key: str, token: str) -> dict:
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             # Retry once on rate limit
-            for attempt in range(2):
-                r = await c.get(UPSTOX_QUOTE_V2,
-                                params={"instrument_key": ",".join(keys)},
-                                headers=_h(token))
-                if r.status_code == 200:
-                    break
-                elif r.status_code == 429 and attempt == 0:
-                    await asyncio.sleep(1.5)
-                else:
-                    print(f"[OptOHLC] HTTP {r.status_code}")
-                    return result
+            async with _quote_chunk_sem:
+                await asyncio.sleep(0.6)
+                for attempt in range(2):
+                    r = await c.get(UPSTOX_QUOTE_V2,
+                                    params={"instrument_key": ",".join(keys)},
+                                    headers=_h(token))
+                    if r.status_code == 200:
+                        break
+                    elif r.status_code == 429 and attempt == 0:
+                        await asyncio.sleep(3)
+                    else:
+                        print(f"[OptOHLC] HTTP {r.status_code}")
+                        return result
             if r.status_code != 200:
                 return result
             data = (r.json() or {}).get("data") or {}
@@ -846,7 +846,7 @@ _mcx_sym_to_key: dict = {}
 _mcx_name_to_numeric: dict = {}
 # Reverse: numeric key → name-based key for MCX (e.g. "MCX_FO|562412" → "MCX_FO|CRUDEOIL26APR9450CE")
 _mcx_numeric_to_name: dict = {}
-_quote_chunk_sem = None  # initialized lazily
+_quote_chunk_sem = asyncio.Semaphore(1)  # serializes ALL Upstox quote API calls
 # NSE_EQ tradingsymbol → instrument_key (e.g. "RELIANCE" → "NSE_EQ|INE002A01018")
 _nse_eq_sym_to_key: dict = {}
 
