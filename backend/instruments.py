@@ -688,9 +688,11 @@ async def fetch_quotes_rest(keys: list, token: str) -> dict:
         if not chunk: continue
         try:
             async with httpx.AsyncClient(timeout=20) as c:
-                r = await c.get(UPSTOX_QUOTE_V2,
-                                params={"instrument_key": ",".join(chunk)},
-                                headers=_h(token))
+                async with _quote_chunk_sem:
+                    await asyncio.sleep(0.6)
+                    r = await c.get(UPSTOX_QUOTE_V2,
+                                    params={"instrument_key": ",".join(chunk)},
+                                    headers=_h(token))
                 if r.status_code == 200:
                     resp_json = r.json()
                     data = resp_json.get("data") if resp_json else None
