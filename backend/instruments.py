@@ -370,6 +370,26 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                 else:
                     break
 
+            # If API spot fetch failed, fall back to live price from WebSocket state
+            if not spot_from_quote:
+                try:
+                    import sys as _sys_sp
+                    _ms = _sys_sp.modules.get("backend.main")
+                    if _ms:
+                        _st = getattr(_ms, "state", None)
+                        _md = getattr(_st, "market_data", {}) if _st else {}
+                        for _sk in (option_key, _opt_name_key):
+                            _td = _md.get(_sk)
+                            if _td:
+                                _lp = ((_td.get("ltpc") or {}).get("ltp") or
+                                       (_td.get("efeed") or {}).get("ltp"))
+                                if _lp:
+                                    spot_from_quote = float(_lp)
+                                    print(f"[MCXChain] {symbol}: spot fallback from market_data → {spot_from_quote}")
+                                    break
+                except Exception:
+                    pass
+
             # Step 4: Find ITM-2 strikes and nearby strikes, fetch their quotes
             step = STRIKE_STEPS.get(symbol.upper(), 50)
             if spot_from_quote:
