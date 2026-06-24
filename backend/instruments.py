@@ -356,7 +356,7 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
             # Upstox quote API needs name-based key for MCX; numeric keys return empty
             _opt_name_key = _mcx_numeric_to_name.get(option_key, option_key)
             async with _quote_chunk_sem:
-                await asyncio.sleep(0.6)
+                await asyncio.sleep(2.0)
                 for attempt in range(2):
                     r2 = await c.get(UPSTOX_QUOTE_V2,
                                      params={"instrument_key": _opt_name_key},
@@ -437,7 +437,7 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
             for i in range(0, len(quote_keys), 25):
                 chunk = quote_keys[i:i+25]
                 async with _quote_chunk_sem:
-                  await asyncio.sleep(0.6)  # enforce ≥0.6s gap between any two chunk requests
+                  await asyncio.sleep(2.0)  # enforce ≥0.6s gap between any two chunk requests
                   # Retry on rate limit (429)
                   for attempt in range(4):
                     r3 = await c.get(UPSTOX_QUOTE_V2,
@@ -689,7 +689,7 @@ async def fetch_quotes_rest(keys: list, token: str) -> dict:
         try:
             async with httpx.AsyncClient(timeout=20) as c:
                 async with _quote_chunk_sem:
-                    await asyncio.sleep(0.6)
+                    await asyncio.sleep(2.0)
                     r = await c.get(UPSTOX_QUOTE_V2,
                                     params={"instrument_key": ",".join(chunk)},
                                     headers=_h(token))
@@ -780,7 +780,7 @@ async def fetch_option_ohlc_rest(ce_key: str, pe_key: str, token: str) -> dict:
         async with httpx.AsyncClient(timeout=10) as c:
             # Retry once on rate limit
             async with _quote_chunk_sem:
-                await asyncio.sleep(0.6)
+                await asyncio.sleep(2.0)
                 for attempt in range(2):
                     r = await c.get(UPSTOX_QUOTE_V2,
                                     params={"instrument_key": ",".join(keys)},
