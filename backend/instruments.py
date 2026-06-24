@@ -428,7 +428,6 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                         quote_keys.append(_nk)
                     _qkey_to_ikey[_nk] = _ik
 
-            print(f"[MCXChain] DEBUG {symbol} quote_keys[:3]={quote_keys[:3]}")
             # Step 5: Fetch quotes in chunks
             # MCX API returns name-based keys (MCX_FO:CRUDEOIL26APR9450CE)
             # even when we request numeric keys (MCX_FO|562412).
