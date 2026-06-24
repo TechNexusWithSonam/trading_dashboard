@@ -534,7 +534,7 @@ async def fetch_option_chain(symbol: str, expiry: str, token: str) -> dict:
         chain = await _fetch_mcx_option_chain(symbol, expiry, token)
         # If all LTPs are zero on expiry day the contract has settled.
         # Fall back to the next available expiry so LOC keeps showing data.
-        if chain and expiry == _d.today().isoformat():
+        if chain and expiry <= _d.today().isoformat():
             if not any(v.get("CE", {}).get("ltp") for v in chain.values()):
                 try:
                     import sys as _sys
