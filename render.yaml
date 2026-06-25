@@ -3,22 +3,23 @@ services:
     name: raima-markets
     runtime: python
     region: singapore
-    plan: free
+    plan: starter
     rootDir: .
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /ping
     envVars:
       - key: UPSTOX_API_KEY
-        value: 8e11a453-2de7-4b87-9e02-986a0661d762
+        sync: false
       - key: UPSTOX_API_SECRET
         sync: false
       - key: UPSTOX_ACCESS_TOKEN
         sync: false
       - key: UPSTOX_REDIRECT_URI
-        value: https://trading-dashboard-15ld.onrender.com/auth/callback
+        value: https://api.raimatheuniqueconcepts.com/auth/callback
       - key: MOCK_MODE
         value: "false"
       - key: DASHBOARD_PASSWORD
-        value: raima2024
+        sync: false
       - key: PYTHON_VERSION
         value: "3.11.0"
