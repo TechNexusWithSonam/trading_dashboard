@@ -1645,6 +1645,11 @@ async def _restart():
 async def feed_log():
     return {"log": state.feed_log[-30:]}
 
+@app.get("/ping")
+async def ping():
+    """Keep-alive endpoint. Ping this every 5 minutes via UptimeRobot to prevent Render cold starts."""
+    return {"ok": True, "ts": int(time.time() * 1000)}
+
 @app.get("/api/status")
 async def api_status():
     return {
