@@ -1247,6 +1247,16 @@ def _is_past_market_close_ist() -> bool:
     return now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 35)
 
 
+def _is_past_mcx_close_ist() -> bool:
+    """True when IST clock is past 23:30 — MCX commodity options have settled.
+    MCX closes at 23:30 IST (11:30 PM), distinct from NSE's 15:35 IST close.
+    Rolling MCX contracts at the NSE close time (15:35) causes 8 hours of wrong
+    spot prices on expiry day when MCX is still actively trading."""
+    from datetime import datetime, timezone, timedelta as _td
+    now_ist = datetime.now(timezone.utc) + _td(hours=5, minutes=30)
+    return now_ist.hour == 23 and now_ist.minute >= 30
+
+
 def get_current_and_next_expiry(expiries: list, symbol: str) -> dict:
     today  = date.today()
     today_s = today.isoformat()

@@ -45,7 +45,7 @@ from .instruments import (
     validate_mcx_keys, calculate_expiries_fallback,
     normalize_mcx_response_key, normalize_response_key,
     refresh_nse_eq_keys, refresh_mcx_option_underlying,
-    STRIKE_STEPS, MONTHLY_SYMBOLS, _is_past_market_close_ist
+    STRIKE_STEPS, MONTHLY_SYMBOLS, _is_past_market_close_ist, _is_past_mcx_close_ist
 )
 from . import instruments as _instruments_mod
 from . import instrument_keys as _ik
@@ -485,7 +485,7 @@ async def startup_init():
 
     COMMODITY_KEYS = list(dict.fromkeys(
         [valid_mcx.get(s, mcx_key(s,0)) for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER","COPPER"]] +
-        [mcx_key(s,1) for s in ["CRUDEOIL","NATURALGAS"]]
+        [mcx_key(s,1) for s in ["CRUDEOIL","NATURALGAS", "COPPER"]]
     ))
 
     # Step 3: Refresh NSE_EQ keys from instrument master (fixes stale ISINs)
@@ -979,13 +979,13 @@ def _align_mcx_spot_to_options() -> list:
         # Only numeric keys can receive WS ticks
         if t and t[:1].isdigit():
             primary.append(k)
-    # Only pre-subscribe next-month futures for CrudeOil and NaturalGas —
-    # these expire every month so we need the upcoming contract subscribed
-    # a few days early. GOLD/SILVER/COPPER options live on the same futures
-    # as their current spot (confirmed via _mcx_option_underlying) so their
-    # next-month futures key is not needed in the WS feed and only creates
-    # "unknown key" noise in market data.
-    _next_mo_syms = {"CRUDEOIL", "NATURALGAS"}
+    # Pre-subscribe next-month futures for monthly MCX symbols (CrudeOil, NaturalGas,
+    # Copper) so there is no WS subscription gap when the current month expires.
+    # Without pre-subscription, the new month's spot has no WS feed for up to 60s
+    # after rollover (the periodic_refresh interval), causing stale/zero LOC values.
+    # GOLD/SILVER are excluded: bi-monthly/quarterly schedule means mcx_key(s,1)
+    # may point to a non-existent intermediate month.
+    _next_mo_syms = {"CRUDEOIL", "NATURALGAS", "COPPER"}
     next_mo = []
     next_mo_map = {}  # key → "SYM/YYYY-MM" for diagnostics
     for s in _MCX_LOC:
@@ -997,7 +997,17 @@ def _align_mcx_spot_to_options() -> list:
             yr2 = int(nm[:4]); mo2 = int(nm[5:7])
         except Exception:
             continue
-        k2 = mcx_key_for_month(s, yr2, mo2)
+        # For next-month-convention symbols (NaturalGas), the next option expiry
+        # in month mo2 is listed under FUTURES month mo2+1. Pre-subscribe that
+        # futures key so the correct underlying is ready before the options roll.
+        # Without this correction, NaturalGas pre-subscribes the wrong futures
+        # (e.g. AUGFUT for "next_month=2026-08" instead of SEPFUT).
+        if s in _instruments_mod._MCX_NEXT_MONTH_OPTION_SYMBOLS:
+            fmo2 = mo2 % 12 + 1
+            fyr2 = yr2 + (1 if mo2 == 12 else 0)
+            k2 = mcx_key_for_month(s, fyr2, fmo2)
+        else:
+            k2 = mcx_key_for_month(s, yr2, mo2)
         t2 = k2.split("|", 1)[1] if "|" in k2 else ""
         if t2 and t2[:1].isdigit():
             next_mo.append(k2)
@@ -1214,13 +1224,20 @@ async def _daily_rollover_check():
         for s in priority_syms
         if state.expiry_cache.get(s)
     )
-    # Post-market intraday rollover: if today IS any priority symbol's expiry
-    # and NSE market has closed (15:35 IST), treat it as expired so we roll
-    # to the next contract without waiting until midnight.
+    # Post-market intraday rollover — segment-aware:
+    # NSE indices settle at 15:35 IST; MCX commodities at 23:30 IST.
+    # Mixing these caused COPPER/NATURALGAS to roll 8 hours early, showing
+    # next-month prices while the physical contract was still trading.
     if not has_expired_default and _is_past_market_close_ist():
         has_expired_default = any(
             (state.expiry_cache.get(s) or {}).get("default", "") == today_s
-            for s in priority_syms
+            for s in _INDEX_LOC          # NSE indices only
+            if state.expiry_cache.get(s)
+        )
+    if not has_expired_default and _is_past_mcx_close_ist():
+        has_expired_default = any(
+            (state.expiry_cache.get(s) or {}).get("default", "") == today_s
+            for s in _MCX_LOC            # MCX commodities only
             if state.expiry_cache.get(s)
         )
     if _last_rollover_check_date == today_d and not has_expired_default:

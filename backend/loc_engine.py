@@ -501,6 +501,7 @@ class LOCEngine:
             "pe_low":    round(st.pe.effective_low, 2),
             "ce_iv":     round(st.ce.iv, 2),
             "pe_iv":     round(st.pe.iv, 2),
+            "ts":        int(time.time() * 1000),
         })
         st.loc_result = res
         if self.on_loc_update:
