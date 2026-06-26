@@ -180,23 +180,11 @@ async def fetch_expiry_list(symbol: str, token: str) -> list:
 
 # ── MCX option chain (built from contracts + quotes) ────────────
 def _mcx_underlying_for_expiry(symbol: str, expiry: str) -> str:
-    """Pick the MCX futures underlying whose month matches the requested option
-    expiry.
+    """Pick the MCX futures underlying whose month matches the requested option expiry.
 
-    Convention distinction (critical):
-      _MCX_NEXT_MONTH_SEED (NaturalGas only):
-        expiry month Y → futures month Y+1
-        e.g. June options → July futures (the option EXPIRY and FUTURES differ)
-      All other MCX symbols (Copper, Gold, Silver, CrudeOil, etc.):
-        expiry month Y → futures month Y (SAME month)
-        Note: validator may detect Copper/Silver options living on a DIFFERENT
-        futures than the SPOT (because spot is one month behind), but the
-        option CONTRACT still expires in the SAME month as its futures.
-
-    Using _MCX_NEXT_MONTH_OPTION_SYMBOLS (which validator adds Copper/Silver to)
-    for the shift causes _align_mcx_spot_to_options() to point COPPER spot at
-    AUGFUT when JULFUT is correct (e.g. July expiry → AUGFUT instead of JULFUT).
-    Only the seeded set (NaturalGas) should apply the +1 shift here.
+    All MCX commodities use same-month convention: expiry month Y → futures month Y.
+    (Copper, Silver, NaturalGas all confirmed same-month from live contract data.)
+    Returns "" if the instrument master hasn't been loaded or no match found.
     """
     if not expiry or len(expiry) < 7 or not _mcx_sym_to_key:
         return ""
@@ -205,14 +193,7 @@ def _mcx_underlying_for_expiry(symbol: str, expiry: str) -> str:
     except Exception:
         return ""
     sym_upper = symbol.upper()
-    # Only NaturalGas (seeded) has expiry-Y → futures-Y+1 convention.
-    # Copper/Silver detected by validator as "next-month" have expiry-Y → futures-Y.
-    if sym_upper in _MCX_NEXT_MONTH_SEED:
-        mo_adj = mo % 12 + 1
-        yr_adj = yr + (1 if mo == 12 else 0)
-    else:
-        mo_adj, yr_adj = mo, yr
-    mon_str = f"{str(yr_adj)[2:]}{_M[mo_adj - 1]}"   # e.g. "26JUL" for NaturalGas June expiry
+    mon_str = f"{str(yr)[2:]}{_M[mo - 1]}"   # e.g. "26JUL"
     target = f"{sym_upper}{mon_str}FUT"
     if target in _mcx_sym_to_key:
         return _mcx_sym_to_key[target]
@@ -962,13 +943,12 @@ def _resolve_mcx_key(sym: str, months_ahead: int) -> str:
 # MCX option underlying keys (may differ from spot futures key)
 _mcx_option_underlying: dict = {}   # sym → instrument_key for option chain
 
-# Stable MCX exchange conventions: options for these symbols are listed under
-# the NEXT month's futures (e.g. NaturalGas June options → July futures).
-# This is a known, stable broker rule — it does NOT change month-to-month.
-# _MCX_NEXT_MONTH_SEED is the immutable ground-truth; validate_mcx_keys()
-# may add symbols but must never remove seeded ones (API evidence can be
-# misleading when expired contracts are still returned by the broker).
-_MCX_NEXT_MONTH_SEED: frozenset = frozenset({"NATURALGAS"})
+# All MCX commodity options confirmed same-month convention (expiry Y → futures Y).
+# _MCX_NEXT_MONTH_OPTION_SYMBOLS tracks when active option contracts live on a
+# DIFFERENT futures key than the current spot (near-expiry transition). Used only
+# to find the correct option chain via _mcx_option_underlying — NOT for
+# expiry→futures month resolution (always same-month for all MCX instruments).
+_MCX_NEXT_MONTH_SEED: frozenset = frozenset()   # empty — all MCX same-month convention
 _MCX_NEXT_MONTH_OPTION_SYMBOLS: set = set(_MCX_NEXT_MONTH_SEED)
 
 async def validate_mcx_keys(token: str) -> dict:
