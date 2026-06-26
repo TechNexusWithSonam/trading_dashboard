@@ -1492,7 +1492,7 @@ async def _flush_feed_buffer():
         msg = {
             "type": "live_feed",
             "feeds": feeds,
-            "currentTs": str(int(time.time() * 1000)),
+            "currentTs": int(time.time() * 1000),
             "loc_results": loc_engine.get_all_results(),
             "calc_results": loc_engine.get_all_calc_results(),
         }
