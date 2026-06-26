@@ -997,12 +997,13 @@ def _align_mcx_spot_to_options() -> list:
             yr2 = int(nm[:4]); mo2 = int(nm[5:7])
         except Exception:
             continue
-        # For next-month-convention symbols (NaturalGas), the next option expiry
-        # in month mo2 is listed under FUTURES month mo2+1. Pre-subscribe that
-        # futures key so the correct underlying is ready before the options roll.
-        # Without this correction, NaturalGas pre-subscribes the wrong futures
-        # (e.g. AUGFUT for "next_month=2026-08" instead of SEPFUT).
-        if s in _instruments_mod._MCX_NEXT_MONTH_OPTION_SYMBOLS:
+        # For NaturalGas (seeded next-month: expiry Y → futures Y+1), the next
+        # option expiry month mo2 maps to futures month mo2+1. Pre-subscribe
+        # that futures key. Copper/Silver have expiry Y → futures Y (same month)
+        # even though validator adds them to _MCX_NEXT_MONTH_OPTION_SYMBOLS.
+        # Using _MCX_NEXT_MONTH_SEED (not the broader set) avoids pre-subscribing
+        # OCTFUT for Copper "next_month=2026-09" when SEPFUT is correct.
+        if s in _instruments_mod._MCX_NEXT_MONTH_SEED:
             fmo2 = mo2 % 12 + 1
             fyr2 = yr2 + (1 if mo2 == 12 else 0)
             k2 = mcx_key_for_month(s, fyr2, fmo2)

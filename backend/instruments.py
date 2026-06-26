@@ -181,11 +181,22 @@ async def fetch_expiry_list(symbol: str, token: str) -> list:
 # ── MCX option chain (built from contracts + quotes) ────────────
 def _mcx_underlying_for_expiry(symbol: str, expiry: str) -> str:
     """Pick the MCX futures underlying whose month matches the requested option
-    expiry. For most symbols (CrudeOil, Gold, Silver, Copper) options live under
-    the same-month futures. For symbols in _MCX_NEXT_MONTH_OPTION_SYMBOLS
-    (NaturalGas), options are listed under the NEXT month's futures:
-      June options → July futures, July options → August futures, etc.
-    Returns "" if the instrument master hasn't been loaded or no match found.
+    expiry.
+
+    Convention distinction (critical):
+      _MCX_NEXT_MONTH_SEED (NaturalGas only):
+        expiry month Y → futures month Y+1
+        e.g. June options → July futures (the option EXPIRY and FUTURES differ)
+      All other MCX symbols (Copper, Gold, Silver, CrudeOil, etc.):
+        expiry month Y → futures month Y (SAME month)
+        Note: validator may detect Copper/Silver options living on a DIFFERENT
+        futures than the SPOT (because spot is one month behind), but the
+        option CONTRACT still expires in the SAME month as its futures.
+
+    Using _MCX_NEXT_MONTH_OPTION_SYMBOLS (which validator adds Copper/Silver to)
+    for the shift causes _align_mcx_spot_to_options() to point COPPER spot at
+    AUGFUT when JULFUT is correct (e.g. July expiry → AUGFUT instead of JULFUT).
+    Only the seeded set (NaturalGas) should apply the +1 shift here.
     """
     if not expiry or len(expiry) < 7 or not _mcx_sym_to_key:
         return ""
@@ -194,8 +205,9 @@ def _mcx_underlying_for_expiry(symbol: str, expiry: str) -> str:
     except Exception:
         return ""
     sym_upper = symbol.upper()
-    # NaturalGas and any confirmed next-month-convention symbols: shift one month forward
-    if sym_upper in _MCX_NEXT_MONTH_OPTION_SYMBOLS:
+    # Only NaturalGas (seeded) has expiry-Y → futures-Y+1 convention.
+    # Copper/Silver detected by validator as "next-month" have expiry-Y → futures-Y.
+    if sym_upper in _MCX_NEXT_MONTH_SEED:
         mo_adj = mo % 12 + 1
         yr_adj = yr + (1 if mo == 12 else 0)
     else:
