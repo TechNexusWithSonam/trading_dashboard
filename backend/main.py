@@ -1317,22 +1317,51 @@ async def _daily_rollover_check():
     asyncio.create_task(_stocks_background())
 
 
+async def _supervise(name: str, coro_factory, restart_delay: float = 5.0):
+    """Run a background task forever — if it ever exits (returns, or an
+    exception escapes its own internal handling) log it and restart after
+    `restart_delay`. Without this, a single uncaught exception in a
+    long-running task like the feed flusher or periodic refresher would
+    silently and permanently stop that task — FastAPI itself keeps running
+    (so systemd sees no crash), but the data it was responsible for
+    (broadcasts, chain/option refreshes) stops forever until a manual
+    restart. asyncio.CancelledError is re-raised so intentional
+    cancellation (e.g. during /auth/token restart) still works."""
+    while True:
+        try:
+            await coro_factory()
+            print(f"[Supervisor] {name} exited normally — restarting in {restart_delay}s")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            import traceback
+            print(f"[Supervisor] {name} crashed: {e} — restarting in {restart_delay}s")
+            traceback.print_exc()
+        await asyncio.sleep(restart_delay)
+
+
 async def periodic_refresh():
     tick = 0
     while True:
         await asyncio.sleep(60)
         if not state.access_token: continue
-        # Day-change rollover: detect once per new calendar day.
         try:
-            await _daily_rollover_check()
+            # Day-change rollover: detect once per new calendar day.
+            try:
+                await _daily_rollover_check()
+            except Exception as e:
+                print(f"[Rollover] check error: {e}")
+            await loc_engine.refresh_all_chains()
+            await _subscribe_new_option_keys()
+            tick += 1
+            # Refresh prev_close cache every 10 minutes so MCX/stale-day values recover
+            if tick % 10 == 0:
+                await _refresh_prev_close_cache()
         except Exception as e:
-            print(f"[Rollover] check error: {e}")
-        await loc_engine.refresh_all_chains()
-        await _subscribe_new_option_keys()
-        tick += 1
-        # Refresh prev_close cache every 10 minutes so MCX/stale-day values recover
-        if tick % 10 == 0:
-            await _refresh_prev_close_cache()
+            # Any uncaught exception here would silently kill this task
+            # forever — chains/options would stop refreshing with no crash
+            # and no log until the process is restarted.
+            print(f"[PeriodicRefresh] error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1364,9 +1393,16 @@ def _ws_connect(url, headers):
 # ══════════════════════════════════════════════════════════════════
 #  BROWSER WEBSOCKET
 # ══════════════════════════════════════════════════════════════════
+WS_HEARTBEAT_SEC = 15   # how often the server pings each client
+WS_STALE_SEC     = 45   # no client activity (msg or pong) for this long → force-close
+
 @app.websocket("/ws/feed")
 async def ws_browser(ws: WebSocket):
-    await ws.accept(); state.connected_clients.add(ws)
+    await ws.accept()
+    state.connected_clients.add(ws)
+    print(f"[WS] Client connected — total={len(state.connected_clients)}")
+    last_seen = {"ts": time.time()}
+
     try:
         await ws.send_text(json.dumps({
             "type": "snapshot",
@@ -1379,11 +1415,60 @@ async def ws_browser(ws: WebSocket):
             "commodity_keys": COMMODITY_KEYS,
             "mode": "mock" if USE_MOCK else "live",
         }))
-        while True:
-            await asyncio.sleep(15)
-            await ws.send_text(json.dumps({"type":"ping","ts":int(time.time()*1000)}))
-    except (WebSocketDisconnect, Exception): pass
-    finally: state.connected_clients.discard(ws)
+    except Exception as e:
+        print(f"[WS] Initial snapshot send failed: {e}")
+        state.connected_clients.discard(ws)
+        return
+
+    async def _receiver():
+        """Continuously drain client frames (pong replies, control frames).
+        Starlette only surfaces a disconnect once the ASGI receive queue is
+        read — without this loop a half-dead socket can sit in
+        connected_clients indefinitely because nothing ever calls receive()."""
+        try:
+            while True:
+                await ws.receive_text()
+                last_seen["ts"] = time.time()
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            print(f"[WS] receive error: {e}")
+
+    async def _heartbeat():
+        """Ping every WS_HEARTBEAT_SEC; force-close if the client has been
+        silent for WS_STALE_SEC. Catches half-open connections (laptop
+        sleep, mobile network switch, idle proxy drop) where the browser
+        never fires onclose/onerror, so the frontend would otherwise never
+        know to reconnect."""
+        try:
+            while True:
+                await asyncio.sleep(WS_HEARTBEAT_SEC)
+                if time.time() - last_seen["ts"] > WS_STALE_SEC:
+                    print("[WS] Client stale (no activity) — closing")
+                    return
+                try:
+                    await ws.send_text(json.dumps({"type": "ping", "ts": int(time.time()*1000)}))
+                except Exception as e:
+                    print(f"[WS] ping send failed, dropping client: {e}")
+                    return
+        except Exception as e:
+            print(f"[WS] heartbeat error: {e}")
+
+    recv_task = asyncio.create_task(_receiver())
+    hb_task   = asyncio.create_task(_heartbeat())
+    try:
+        await asyncio.wait({recv_task, hb_task}, return_when=asyncio.FIRST_COMPLETED)
+    except Exception as e:
+        print(f"[WS] session error: {e}")
+    finally:
+        for t in (recv_task, hb_task):
+            if not t.done(): t.cancel()
+        state.connected_clients.discard(ws)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        print(f"[WS] Client disconnected — total={len(state.connected_clients)}")
 
 async def broadcast(msg: dict):
     if msg.get("type") == "live_feed":
@@ -1454,13 +1539,19 @@ async def broadcast(msg: dict):
 
 
 async def _send_to_clients(msg: dict):
-    """Send a message to all connected browser WebSocket clients."""
+    """Send a message to all connected browser WebSocket clients.
+    A send failure on one socket must never affect the others — each send
+    is isolated in its own try/except and failed sockets are dropped."""
     if not state.connected_clients: return
     text = json.dumps(msg); dead = set()
     for ws in list(state.connected_clients):
-        try: await ws.send_text(text)
-        except: dead.add(ws)
-    state.connected_clients -= dead
+        try:
+            await ws.send_text(text)
+        except Exception as e:
+            print(f"[WS] send failed, dropping client: {e}")
+            dead.add(ws)
+    if dead:
+        state.connected_clients -= dead
 
 
 FEED_THROTTLE_MS = 300  # send at most ~3 updates/sec to frontend
@@ -1479,24 +1570,31 @@ async def _flush_feed_buffer():
     """
     while True:
         await asyncio.sleep(FEED_THROTTLE_MS / 1000)
-        if not state.connected_clients:
-            continue
-        has_feeds = bool(state._feed_buffer)
-        has_loc   = bool(state._loc_dirty)
-        if not has_feeds and not has_loc:
-            continue
-        # Swap buffers atomically before await so concurrent updates queue up
-        feeds = state._feed_buffer
-        state._feed_buffer = {}
-        state._loc_dirty.clear()
-        msg = {
-            "type": "live_feed",
-            "feeds": feeds,
-            "currentTs": int(time.time() * 1000),
-            "loc_results": loc_engine.get_all_results(),
-            "calc_results": loc_engine.get_all_calc_results(),
-        }
-        await _send_to_clients(msg)
+        try:
+            if not state.connected_clients:
+                continue
+            has_feeds = bool(state._feed_buffer)
+            has_loc   = bool(state._loc_dirty)
+            if not has_feeds and not has_loc:
+                continue
+            # Swap buffers atomically before await so concurrent updates queue up
+            feeds = state._feed_buffer
+            state._feed_buffer = {}
+            state._loc_dirty.clear()
+            msg = {
+                "type": "live_feed",
+                "feeds": feeds,
+                "currentTs": int(time.time() * 1000),
+                "loc_results": loc_engine.get_all_results(),
+                "calc_results": loc_engine.get_all_calc_results(),
+            }
+            await _send_to_clients(msg)
+        except Exception as e:
+            # Never let a single bad iteration (e.g. a transient KeyError in
+            # loc_engine results) kill this task forever — an uncaught
+            # exception here would silently end all future broadcasts to
+            # every connected client until the process restarts.
+            print(f"[Flush] error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1638,11 +1736,11 @@ async def _restart():
     print("[Restart] Restarting...")
     if state.feed_task and not state.feed_task.done():
         state.feed_task.cancel(); await asyncio.sleep(1)
-    state.feed_task = asyncio.create_task(start_feed())
+    state.feed_task = asyncio.create_task(_supervise("start_feed", start_feed))
     await asyncio.sleep(3)
     await startup_init()
     if state.chain_task and not state.chain_task.done(): state.chain_task.cancel()
-    state.chain_task = asyncio.create_task(periodic_refresh())
+    state.chain_task = asyncio.create_task(_supervise("periodic_refresh", periodic_refresh))
     print("[Restart] Done")
 
 
@@ -1964,25 +2062,25 @@ async def on_startup():
 
     if USE_MOCK:
         from backend.mock_feed import start_mock_feed
-        state.feed_task = asyncio.create_task(start_mock_feed(broadcast))
+        state.feed_task = asyncio.create_task(_supervise("start_mock_feed", lambda: start_mock_feed(broadcast)))
     elif state.access_token:
         loc_engine.access_token = state.access_token
-        state.feed_task = asyncio.create_task(start_feed())
+        state.feed_task = asyncio.create_task(_supervise("start_feed", start_feed))
     else:
         print("[!] No token — POST /auth/token or set UPSTOX_ACCESS_TOKEN in .env")
 
-    # Start throttled feed flush task
-    state._flush_task = asyncio.create_task(_flush_feed_buffer())
+    # Start throttled feed flush task (supervised — never allowed to die silently)
+    state._flush_task = asyncio.create_task(_supervise("flush_feed_buffer", _flush_feed_buffer))
 
     # Start stale-option monitor (Bug 1 fallback: REST fetch when WS tick absent)
-    asyncio.create_task(_stale_option_monitor())
+    asyncio.create_task(_supervise("stale_option_monitor", _stale_option_monitor))
 
     asyncio.create_task(_delayed_startup())
 
 async def _delayed_startup():
     await asyncio.sleep(3)
     await startup_init()
-    state.chain_task = asyncio.create_task(periodic_refresh())
+    state.chain_task = asyncio.create_task(_supervise("periodic_refresh", periodic_refresh))
 
 if __name__ == "__main__":
     import uvicorn
