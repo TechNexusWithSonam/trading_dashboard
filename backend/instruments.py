@@ -348,22 +348,21 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
             spot_from_quote = 0.0
             # Upstox quote API needs name-based key for MCX; numeric keys return empty
             _opt_name_key = _mcx_numeric_to_name.get(option_key, option_key)
-            async with _quote_chunk_sem:
-                await asyncio.sleep(2.0)
-                for attempt in range(2):
-                    r2 = await c.get(UPSTOX_QUOTE_V2,
-                                     params={"instrument_key": _opt_name_key},
-                                     headers=_h(token))
-                    if r2.status_code == 200:
-                        for _, v in (r2.json().get("data", {}) or {}).items():
-                            if v:
-                                spot_from_quote = float(v.get("last_price", 0))
-                                break
-                        break
-                    elif r2.status_code == 429 and attempt == 0:
-                        await asyncio.sleep(3)
-                    else:
-                        break
+            await _quote_throttle()
+            for attempt in range(2):
+                r2 = await c.get(UPSTOX_QUOTE_V2,
+                                 params={"instrument_key": _opt_name_key},
+                                 headers=_h(token))
+                if r2.status_code == 200:
+                    for _, v in (r2.json().get("data", {}) or {}).items():
+                        if v:
+                            spot_from_quote = float(v.get("last_price", 0))
+                            break
+                    break
+                elif r2.status_code == 429 and attempt == 0:
+                    await asyncio.sleep(3)
+                else:
+                    break
 
             # If API spot fetch failed, fall back to live price from WebSocket state
             if not spot_from_quote:
@@ -428,22 +427,16 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
             quotes = {}
             for i in range(0, len(quote_keys), 25):
                 chunk = quote_keys[i:i+25]
-                async with _quote_chunk_sem:
-                  await asyncio.sleep(2.0)  # enforce ≥0.6s gap between any two chunk requests
-                  # Retry on rate limit (429)
-                  for attempt in range(4):
+                await _quote_throttle()
+                for attempt in range(4):
                     r3 = await c.get(UPSTOX_QUOTE_V2,
                                      params={"instrument_key": ",".join(chunk)},
                                      headers=_h(token))
                     if r3.status_code == 200:
                         resp_data = (r3.json().get("data", {}) or {})
-                        # Map response name-based keys to numeric keys
                         for rk, rv in resp_data.items():
                             if rv:
                                 quotes[rk.replace(":", "|", 1)] = rv
-                        # Map requested numeric keys -> name-based response keys.
-                        # Prefer _mcx_numeric_to_name; fall back to key_to_tsym
-                        # built from contracts (covers option keys not in master).
                         for req_key in chunk:
                             name_key = _mcx_numeric_to_name.get(req_key, "")
                             if not name_key:
@@ -463,7 +456,6 @@ async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
                     else:
                         print(f"[MCXChain] Quote chunk {i//25+1} HTTP {r3.status_code}")
                         break
-                await asyncio.sleep(0.3)
 
             # Back-map name-based quote keys → numeric keys for chain building
             for _nk, _ik in _qkey_to_ikey.items():
@@ -675,11 +667,10 @@ async def fetch_quotes_rest(keys: list, token: str) -> dict:
         if not chunk: continue
         try:
             async with httpx.AsyncClient(timeout=20) as c:
-                async with _quote_chunk_sem:
-                    await asyncio.sleep(2.0)
-                    r = await c.get(UPSTOX_QUOTE_V2,
-                                    params={"instrument_key": ",".join(chunk)},
-                                    headers=_h(token))
+                await _quote_throttle()
+                r = await c.get(UPSTOX_QUOTE_V2,
+                                params={"instrument_key": ",".join(chunk)},
+                                headers=_h(token))
                 if r.status_code == 200:
                     resp_json = r.json()
                     data = resp_json.get("data") if resp_json else None
@@ -765,20 +756,18 @@ async def fetch_option_ohlc_rest(ce_key: str, pe_key: str, token: str) -> dict:
     result = {}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            # Retry once on rate limit
-            async with _quote_chunk_sem:
-                await asyncio.sleep(2.0)
-                for attempt in range(2):
-                    r = await c.get(UPSTOX_QUOTE_V2,
-                                    params={"instrument_key": ",".join(keys)},
-                                    headers=_h(token))
-                    if r.status_code == 200:
-                        break
-                    elif r.status_code == 429 and attempt == 0:
-                        await asyncio.sleep(3)
-                    else:
-                        print(f"[OptOHLC] HTTP {r.status_code}")
-                        return result
+            await _quote_throttle()
+            for attempt in range(2):
+                r = await c.get(UPSTOX_QUOTE_V2,
+                                params={"instrument_key": ",".join(keys)},
+                                headers=_h(token))
+                if r.status_code == 200:
+                    break
+                elif r.status_code == 429 and attempt == 0:
+                    await asyncio.sleep(3)
+                else:
+                    print(f"[OptOHLC] HTTP {r.status_code}")
+                    return result
             if r.status_code != 200:
                 return result
             data = (r.json() or {}).get("data") or {}
@@ -836,6 +825,20 @@ _mcx_name_to_numeric: dict = {}
 # Reverse: numeric key → name-based key for MCX (e.g. "MCX_FO|562412" → "MCX_FO|CRUDEOIL26APR9450CE")
 _mcx_numeric_to_name: dict = {}
 _quote_chunk_sem = asyncio.Semaphore(1)  # serializes ALL Upstox quote API calls
+_QUOTE_MIN_INTERVAL = 0.6  # minimum seconds between any two quote API calls
+_quote_last_call: float = 0.0
+
+async def _quote_throttle():
+    """Rate-limit Upstox quote calls to at most 1 per _QUOTE_MIN_INTERVAL seconds
+    WITHOUT holding the semaphore during the sleep. This prevents the semaphore
+    from blocking the entire event loop for 2 full seconds per call."""
+    global _quote_last_call
+    async with _quote_chunk_sem:
+        now = time.time()
+        wait = _QUOTE_MIN_INTERVAL - (now - _quote_last_call)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _quote_last_call = time.time()
 # NSE_EQ tradingsymbol → instrument_key (e.g. "RELIANCE" → "NSE_EQ|INE002A01018")
 _nse_eq_sym_to_key: dict = {}
 

@@ -74,6 +74,7 @@ FEED_KEY_TO_SYM: dict = {}
 option_key_map:      dict = {}   # LOC option key → (symbol, "CE"/"PE")
 calc_option_key_map: dict = {}   # Calculator option key → (symbol, "CE"/"PE")
 option_key_last_tick: dict = {}  # instrument_key → last WS tick timestamp (for stale detection)
+_OPTION_KEY_MAX_AGE = 3600  # prune entries older than 1 hour to prevent unbounded growth
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -846,15 +847,27 @@ async def _stale_option_monitor():
     received no WS tick. If stale, fall back to REST to fetch LTP and inject
     into the LOC engine — so LOC never freezes due to a dead WS key.
 
-    Bug 1 fix: catches CRUDEOIL PE (and any other option) that is subscribed
-    but whose exchange feed delivers no ticks (illiquid strike, MCX WS issue)."""
+    Also prunes option_key_last_tick of keys no longer in use to prevent
+    unbounded memory growth across ATM shifts over multiple days."""
     STALE_SEC = 30
-    # Give startup a full minute before first check so chains/OHLC have loaded.
     await asyncio.sleep(60)
     while True:
         await asyncio.sleep(STALE_SEC)
         if not state.access_token: continue
         now = time.time()
+
+        # Prune stale entries from option_key_last_tick
+        active_keys = set()
+        for st in loc_engine.symbols.values():
+            if st.ce.instrument_key: active_keys.add(st.ce.instrument_key)
+            if st.pe.instrument_key: active_keys.add(st.pe.instrument_key)
+        stale_keys = [k for k, ts in list(option_key_last_tick.items())
+                      if k not in active_keys and (now - ts) > _OPTION_KEY_MAX_AGE]
+        for k in stale_keys:
+            option_key_last_tick.pop(k, None)
+        if stale_keys:
+            print(f"[Stale] Pruned {len(stale_keys)} inactive option_key_last_tick entries")
+
         for sym in list(loc_engine.symbols):
             st = loc_engine.get_state(sym)
             if not st: continue
@@ -873,7 +886,7 @@ async def _stale_option_monitor():
                     await _stale_fetch_option_ltp(sym)
                 except Exception as e:
                     print(f"[Stale] {sym} REST fallback error: {e}")
-                await asyncio.sleep(0.2)  # small gap between symbols to avoid rate limit
+                await asyncio.sleep(0.2)
 
 
 async def _refresh_prev_close_cache():
@@ -1377,13 +1390,21 @@ async def _sub_binary(ws, keys: list, mode: str = "full"):
     print(f"[Feed] Subscribing {len(keys)} keys, mode={mode}")
     await ws.send(msg)   # BINARY frame (bytes)
 
+# How long the Upstox WS can be silent before we force-reconnect.
+# Upstox sends ticks every ~1 s during market hours; 120 s of silence
+# means the TCP connection is half-open (NAT/LB timeout).
+_FEED_SILENCE_TIMEOUT = 120  # seconds
+
 def _ws_connect(url, headers):
     import ssl as _ssl
     sig = inspect.signature(websockets.connect); p = sig.parameters
     ctx = _ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = _ssl.CERT_NONE
-    kw  = dict(ping_interval=None, ping_timeout=None, max_size=2**24, ssl=ctx)
+    # ping_interval=20 makes websockets send a WS-level ping every 20 s and
+    # close the connection if no pong arrives within ping_timeout=10 s.
+    # This is the primary fix for the half-open TCP freeze after 1-2 days.
+    kw  = dict(ping_interval=20, ping_timeout=10, max_size=2**24, ssl=ctx)
     if headers:
         if "extra_headers" in p: kw["extra_headers"] = headers
         else:                    kw["additional_headers"] = headers
@@ -1421,14 +1442,15 @@ async def ws_browser(ws: WebSocket):
         return
 
     async def _receiver():
-        """Continuously drain client frames (pong replies, control frames).
-        Starlette only surfaces a disconnect once the ASGI receive queue is
-        read — without this loop a half-dead socket can sit in
-        connected_clients indefinitely because nothing ever calls receive()."""
+        """Drain all incoming client frames (text, bytes, disconnect).
+        Using receive() instead of receive_text() so pong/binary control
+        frames don't raise and silently kill this task."""
         try:
             while True:
-                await ws.receive_text()
+                msg = await ws.receive()
                 last_seen["ts"] = time.time()
+                if msg["type"] == "websocket.disconnect":
+                    break
         except WebSocketDisconnect:
             pass
         except Exception as e:
@@ -1660,28 +1682,60 @@ async def start_feed():
                       f"{len(opt_keys)} options")
 
                 tick_n = 0
+                last_frame_ts = time.time()
                 print(f"[Feed] Waiting for data...")
-                async for raw in ws:
-                    state.frame_count += 1
-                    rtype = "binary" if isinstance(raw, bytes) else "text"
-                    rlen = len(raw) if raw else 0
-                    try:
-                        msg = (decode_v3(raw) if isinstance(raw,bytes)
-                               else (json.loads(raw) if raw else None))
-                        if msg and (msg.get("feeds") or msg.get("marketInfo")):
-                            state.decode_ok += 1
-                            nf = len(msg.get("feeds",{}))
-                            mt = msg.get("type","?")
-                            if state.frame_count <= 10 or state.frame_count % 100 == 0:
-                                print(f"[Feed] Frame #{state.frame_count}: {rtype} {rlen}B → type={mt} feeds={nf}")
-                            await broadcast(msg)
-                            tick_n += 1
-                            if tick_n % 300 == 0:
-                                await _subscribe_new_option_keys()
-                        else:
-                            print(f"[Feed] Frame #{state.frame_count}: {rtype} {rlen}B → decode returned None")
-                    except Exception as ex:
-                        print(f"[Decode] Frame #{state.frame_count}: {rtype} {rlen}B → error: {ex}")
+
+                async def _read_frames():
+                    nonlocal tick_n, last_frame_ts
+                    async for raw in ws:
+                        last_frame_ts = time.time()
+                        state.frame_count += 1
+                        rtype = "binary" if isinstance(raw, bytes) else "text"
+                        rlen = len(raw) if raw else 0
+                        try:
+                            msg = (decode_v3(raw) if isinstance(raw, bytes)
+                                   else (json.loads(raw) if raw else None))
+                            if msg and (msg.get("feeds") or msg.get("marketInfo")):
+                                state.decode_ok += 1
+                                nf = len(msg.get("feeds", {}))
+                                mt = msg.get("type", "?")
+                                if state.frame_count <= 10 or state.frame_count % 100 == 0:
+                                    print(f"[Feed] Frame #{state.frame_count}: {rtype} {rlen}B → type={mt} feeds={nf}")
+                                await broadcast(msg)
+                                tick_n += 1
+                                if tick_n % 300 == 0:
+                                    await _subscribe_new_option_keys()
+                            else:
+                                print(f"[Feed] Frame #{state.frame_count}: {rtype} {rlen}B → decode returned None")
+                        except Exception as ex:
+                            print(f"[Decode] Frame #{state.frame_count}: {rtype} {rlen}B → error: {ex}")
+
+                async def _silence_watchdog():
+                    """Force-close the WS if no frame arrives for _FEED_SILENCE_TIMEOUT s.
+                    Catches half-open TCP connections where ping_interval alone may not
+                    fire (e.g. Upstox sends a pong but no data ticks during pre-open)."""
+                    while True:
+                        await asyncio.sleep(30)
+                        age = time.time() - last_frame_ts
+                        if age > _FEED_SILENCE_TIMEOUT:
+                            print(f"[Feed] Silence watchdog: no frame for {age:.0f}s — forcing reconnect")
+                            await ws.close()
+                            return
+
+                read_task = asyncio.ensure_future(_read_frames())
+                wdog_task = asyncio.ensure_future(_silence_watchdog())
+                try:
+                    done, pending = await asyncio.wait(
+                        {read_task, wdog_task}, return_when=asyncio.FIRST_COMPLETED)
+                    for t in pending:
+                        t.cancel()
+                    # Re-raise any exception from the reader
+                    for t in done:
+                        if not t.cancelled() and t.exception():
+                            raise t.exception()
+                finally:
+                    read_task.cancel()
+                    wdog_task.cancel()
                 print("[Feed] WebSocket loop ended (server closed connection)")
 
         except asyncio.CancelledError: break

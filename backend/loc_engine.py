@@ -505,7 +505,8 @@ class LOCEngine:
         })
         st.loc_result = res
         if self.on_loc_update:
-            asyncio.create_task(self.on_loc_update(symbol, res))
+            t = asyncio.create_task(self.on_loc_update(symbol, res))
+            t.add_done_callback(lambda f: f.exception() if not f.cancelled() and f.exception() else None)
 
     def recalc(self, symbol:str):
         return self._recalc(symbol)
