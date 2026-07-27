@@ -2136,9 +2136,21 @@ async def root():
 
 @app.get("/{path:path}")
 async def spa(path: str):
-    f = FRONTEND_DIST/path
-    if f.exists() and f.is_file(): return FileResponse(str(f))
     idx = FRONTEND_DIST/"index.html"
+    # Resolve and require the result to stay inside FRONTEND_DIST (blocks
+    # ../ path traversal out of the dist folder) AND reject any dotfile
+    # segment (blocks serving a stray .env/.git/etc. that ended up inside
+    # frontend/dist — e.g. via a file accidentally placed in frontend/public/
+    # and copied verbatim into the build output by Vite). A real request for
+    # /.env from the public internet returned 200 OK before this check existed.
+    try:
+        base = FRONTEND_DIST.resolve()
+        f = (FRONTEND_DIST/path).resolve()
+        rel = f.relative_to(base)
+        if f.is_file() and not any(part.startswith(".") for part in rel.parts):
+            return FileResponse(str(f))
+    except (ValueError, OSError):
+        pass
     if idx.exists(): return FileResponse(str(idx))
     return HTMLResponse("Not found",404)
 
