@@ -757,7 +757,24 @@ async def _subscribe_new_option_keys():
     loc_keys  = [k for k in loc_engine.get_option_keys() if k]
     calc_keys = [k for k in loc_engine.get_calc_option_keys() if k]
     all_keys  = list(dict.fromkeys(loc_keys + calc_keys))
+    all_keys_set = set(all_keys)
     new_keys  = [k for k in all_keys if k not in state.subscribed_option_keys]
+    # get_option_keys()/get_calc_option_keys() only ever return each symbol's
+    # CURRENT ce/pe instrument_key — so anything still in subscribed_option_keys
+    # but no longer in all_keys_set is a superseded key from a strike roll or
+    # expiry rollover that nothing references anymore. Unsubscribe it: leaving
+    # it subscribed forever both wastes a slot against Upstox's per-connection
+    # subscription cap and, once that cap is hit, silently blocks brand-new
+    # strikes from subscribing at all (see _unsub_binary docstring).
+    stale_keys = [k for k in state.subscribed_option_keys if k not in all_keys_set]
+    if stale_keys:
+        try:
+            await _unsub_binary(state.upstox_ws, stale_keys)
+        except Exception as e:
+            print(f"[Options] Unsubscribe error: {e}")
+        state.subscribed_option_keys.difference_update(stale_keys)
+        for key in stale_keys:
+            option_key_last_tick.pop(key, None)
     if new_keys:
         await _sub_binary(state.upstox_ws, new_keys, "full")
         state.subscribed_option_keys.update(new_keys)
@@ -776,11 +793,9 @@ async def _subscribe_new_option_keys():
         # and primes LTP/OHLC before the first WS tick arrives
         if state.access_token:
             asyncio.create_task(_validate_and_prime_option_keys(new_keys))
-    # Always rebuild BOTH maps from current engine state — even when no new
-    # WS subscription is needed. An ATM shift back to a previously-seen
-    # strike leaves the strike in state.subscribed_option_keys (so new_keys
-    # is empty) but changes the instrument_key, so without this rebuild
-    # ticks for the current strike would silently miss and LTP would freeze.
+    # Always rebuild BOTH maps from current engine state — even when neither
+    # subscribe nor unsubscribe ran this call, in case some other path
+    # mutated ce/pe instrument_key without going through this function.
     option_key_map.clear()
     for st in loc_engine.symbols.values():
         if st.ce.instrument_key: option_key_map[st.ce.instrument_key] = (st.symbol,"CE")
@@ -1390,6 +1405,25 @@ async def _sub_binary(ws, keys: list, mode: str = "full"):
     print(f"[Feed] Subscribing {len(keys)} keys, mode={mode}")
     await ws.send(msg)   # BINARY frame (bytes)
 
+async def _unsub_binary(ws, keys: list):
+    """Send unsubscribe as BINARY frame — mirrors _sub_binary. Without this,
+    every ATM/ITM-2 strike roll and every expiry rollover only ever ADDS keys
+    to the live Upstox subscription and never removes the superseded ones —
+    the set grows unbounded for the life of the process. Two consequences:
+    stale keys keep consuming a slot against Upstox's per-connection
+    subscription cap, and once that cap is hit, brand-new strikes (which are
+    exactly what a strike roll or expiry rollover needs fresh ticks for)
+    silently fail to subscribe — the frontend then shows a CE/PE LTP that
+    never updates, indistinguishable from a live illiquid contract."""
+    if not keys: return
+    msg = json.dumps({
+        "guid": f"raima_{int(time.time()*1000)}",
+        "method": "unsub",
+        "data": {"instrumentKeys": keys},
+    }).encode("utf-8")
+    print(f"[Feed] Unsubscribing {len(keys)} superseded keys")
+    await ws.send(msg)   # BINARY frame (bytes)
+
 # How long the Upstox WS can be silent before we force-reconnect.
 # Upstox sends ticks every ~1 s during market hours; 120 s of silence
 # means the TCP connection is half-open (NAT/LB timeout).
@@ -1647,6 +1681,15 @@ async def start_feed():
             async with _ws_connect(FEED_URL, headers) as ws:
                 state.upstox_ws = ws
                 print("[Feed] Connected to Upstox V3 WebSocket")
+                # Fresh connection = fresh subscription state on Upstox's side.
+                # Clear the bookkeeping set so it doesn't carry phantom entries
+                # from the previous connection forward — otherwise a stale key
+                # from before the reconnect looks "already subscribed" to
+                # _subscribe_new_option_keys() even though nothing was ever
+                # sent for it on this connection, and a genuinely new key that
+                # happens to reuse an old (now-stale) bookkeeping entry would
+                # silently never get subscribed at all.
+                state.subscribed_option_keys.clear()
 
                 # 1. Indices — full mode
                 await _sub_binary(ws, INDEX_KEYS, "full")
