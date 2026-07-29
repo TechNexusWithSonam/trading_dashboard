@@ -65,17 +65,30 @@ class Ticker2:
             raise RuntimeError("WebSocket not connected")
         self.mode = KiteTicker.MODE_LTP if mode == "ltp" else KiteTicker.MODE_QUOTE
         new_tokens = [t for t in tokens if t not in self.subscribed_tokens]
+        # Record intent BEFORE touching the wire — connect(threaded=True) returns
+        # before the handshake finishes, so a subscribe() called right after
+        # start() can race a connection that isn't open yet. If we send first
+        # and only record on success, that race drops the tokens permanently
+        # (on_connect's resubscribe only fires if subscribed_tokens is already
+        # populated). Recording first means the pending tokens always get
+        # picked up — either by the wire send below, or by on_connect once the
+        # handshake actually completes.
+        self.subscribed_tokens |= set(tokens)
+        if not self.kws.is_connected():
+            log_h2(f"Queued tokens (Zerodha socket not yet open): {tokens} — on_connect will subscribe them")
+            return
         if new_tokens:
             self.kws.subscribe(new_tokens)
         self.kws.set_mode(self.mode, tokens)
-        self.subscribed_tokens |= set(tokens)
         log_h2(f"Subscribed to tokens: {tokens} (new: {new_tokens})")
 
     def unsubscribe(self, tokens: list[int]):
         if not self.kws:
             return
-        self.kws.unsubscribe(tokens)
         self.subscribed_tokens -= set(tokens)
+        if not self.kws.is_connected():
+            return
+        self.kws.unsubscribe(tokens)
         log_h2(f"Unsubscribed from tokens: {tokens}")
 
     # ---- KiteTicker callbacks: fire on the ticker's background thread ----
