@@ -3,6 +3,7 @@ from every existing route in main.py; the only touch to that file is a
 two-line import + include_router registration.
 """
 import json
+import os
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import RedirectResponse
@@ -17,11 +18,20 @@ from .ticker import ticker2
 router = APIRouter(prefix="/api/history-2", tags=["history2"])
 
 # Registered with Zerodha's app console as
-# https://www.raimatheuniqueconcepts.com/api/zerodha/callback and
-# .../api/zerodha/postback — Kite Connect requires an exact match to the
-# configured redirect URL, so these two routes live outside the
-# /api/history-2 prefix instead of nesting under it.
+# https://api.raimatheuniqueconcepts.com/api/zerodha/callback and
+# .../api/zerodha/postback (must be this API host, not the frontend host —
+# Kite Connect requires an exact match to the configured redirect URL) — so
+# these two routes live outside the /api/history-2 prefix instead of nesting
+# under it.
 zerodha_router = APIRouter(tags=["history2-zerodha-oauth"])
+
+# The post-login redirect must be an ABSOLUTE url to the frontend. A relative
+# "/dashboard?..." resolves against whatever host the browser is currently
+# on — which is this API host (api.raimatheuniqueconcepts.com), not the
+# actual frontend (trading_raima, on Vercel) — and this API process happens
+# to also serve an unrelated legacy static dashboard at "/dashboard", so a
+# relative redirect silently lands the user on the wrong page entirely.
+FRONTEND_URL = os.getenv("ZERODHA_HISTORY2_FRONTEND_URL", "https://www.raimatheuniqueconcepts.com").rstrip("/")
 
 
 @router.get("/zerodha/login")
@@ -44,16 +54,16 @@ async def zerodha_callback(request_token: str = "", status: str = ""):
     # since react-router has no matching Route for it.
     if status and status != "success":
         log_h2_error(f"Zerodha authentication failed (status={status})")
-        return RedirectResponse("/dashboard?history2_auth=failed")
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard?history2_auth=failed")
     if not request_token:
         log_h2_error("Zerodha callback missing request_token")
-        return RedirectResponse("/dashboard?history2_auth=failed")
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard?history2_auth=failed")
     try:
         zc.generate_session(request_token)
     except Exception as e:
         log_h2_error(f"Zerodha authentication failed: {e}")
-        return RedirectResponse("/dashboard?history2_auth=failed")
-    return RedirectResponse("/dashboard?history2_auth=success")
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard?history2_auth=failed")
+    return RedirectResponse(f"{FRONTEND_URL}/dashboard?history2_auth=success")
 
 
 @zerodha_router.post("/api/zerodha/postback")
