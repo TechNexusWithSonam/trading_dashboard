@@ -27,6 +27,11 @@ app = FastAPI(title="RAIMA Markets v9")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
+# History 2 — isolated Zerodha-backed module, does not touch LOC/Upstox state.
+from .history2.routes import router as _history2_router, zerodha_router as _history2_zerodha_router
+app.include_router(_history2_router)
+app.include_router(_history2_zerodha_router)
+
 FRONTEND_DIST   = Path(__file__).parent.parent / "frontend" / "dist"
 FRONTEND_STATIC = Path(__file__).parent.parent / "frontend" / "static"
 FRONTEND_STATIC.mkdir(parents=True, exist_ok=True)
