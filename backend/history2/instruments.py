@@ -22,6 +22,19 @@ SPOT_ALIASES = {
     "BANKEX": ("BSE", "BANKEX"),
 }
 
+# MCX commodities have no cash "spot" instrument the way an index does —
+# options are written on the futures contract, so the nearest-expiry future
+# stands in as the spot proxy. Options/futures for these live on the MCX
+# exchange, not NFO. Requires the Zerodha account to have the commodity
+# segment enabled — if it isn't, the instrument dump for MCX will simply
+# come back without usable contracts and resolution will fail with a clear
+# "not found" rather than a wrong price.
+MCX_UNDERLYINGS = {"CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"}
+
+
+def _option_exchange(underlying: str) -> str:
+    return "MCX" if underlying.upper() in MCX_UNDERLYINGS else "NFO"
+
 
 def _load(exchange: str) -> list[dict]:
     now = time.time()
@@ -49,12 +62,25 @@ def _slim(row: dict) -> dict:
     }
 
 
+def _nearest_mcx_future(underlying: str) -> dict | None:
+    try:
+        rows = _load("MCX")
+    except Exception as e:
+        log_h2_error(f"MCX instrument load failed for {underlying}: {e}")
+        return None
+    futs = [r for r in rows if r.get("name") == underlying and r.get("instrument_type") == "FUT" and r.get("expiry")]
+    if not futs:
+        return None
+    futs.sort(key=lambda r: r["expiry"])
+    return futs[0]
+
+
 def search(query: str, limit: int = 20) -> list[dict]:
     q = query.strip().upper()
     if not q:
         return []
     out = []
-    for exchange in ("NSE", "NFO", "BSE"):
+    for exchange in ("NSE", "NFO", "BSE", "MCX"):
         try:
             rows = _load(exchange)
         except Exception as e:
@@ -70,21 +96,43 @@ def search(query: str, limit: int = 20) -> list[dict]:
 
 def resolve_spot(underlying: str) -> dict | None:
     underlying = underlying.upper()
+
     alias = SPOT_ALIASES.get(underlying)
-    if not alias:
-        log_h2_error(f"Spot instrument not found for {underlying} (no alias mapping)")
+    if alias:
+        exchange, name = alias
+        try:
+            rows = _load(exchange)
+        except Exception as e:
+            log_h2_error(f"Spot instrument resolution failed for {underlying}: {e}")
+            return None
+        for r in rows:
+            if r.get("tradingsymbol") == name:
+                log_h2(f"Spot instrument resolved: {underlying} -> token {r['instrument_token']}")
+                return _slim(r)
+        log_h2_error(f"Spot instrument not found for {underlying} (segment={exchange})")
         return None
-    exchange, name = alias
+
+    if underlying in MCX_UNDERLYINGS:
+        fut = _nearest_mcx_future(underlying)
+        if fut:
+            log_h2(f"Spot instrument resolved (nearest MCX future, no cash spot exists for commodities): "
+                   f"{underlying} -> token {fut['instrument_token']}")
+            return _slim(fut)
+        log_h2_error(f"No MCX future found for {underlying} — confirm the Zerodha account has "
+                     f"the commodity segment enabled")
+        return None
+
+    # F&O stock — its NSE equity tradingsymbol matches the derivatives underlying name exactly.
     try:
-        rows = _load(exchange)
+        rows = _load("NSE")
     except Exception as e:
         log_h2_error(f"Spot instrument resolution failed for {underlying}: {e}")
         return None
     for r in rows:
-        if r.get("tradingsymbol") == name:
-            log_h2(f"Spot instrument resolved: {underlying} -> token {r['instrument_token']}")
+        if r.get("tradingsymbol") == underlying and r.get("instrument_type") == "EQ":
+            log_h2(f"Spot instrument resolved (equity): {underlying} -> token {r['instrument_token']}")
             return _slim(r)
-    log_h2_error(f"Spot instrument not found for {underlying} (segment={exchange})")
+    log_h2_error(f"Spot instrument not found for {underlying} (checked NSE equity segment)")
     return None
 
 
@@ -92,8 +140,9 @@ def resolve_option(underlying: str, expiry: str, strike: float, side: str) -> di
     """side: 'CE' or 'PE'. expiry: 'YYYY-MM-DD'."""
     underlying = underlying.upper()
     side = side.upper()
+    exchange = _option_exchange(underlying)
     try:
-        rows = _load("NFO")
+        rows = _load(exchange)
     except Exception as e:
         log_h2_error(f"{side} instrument resolution failed for {underlying}: {e}")
         return None
@@ -104,15 +153,16 @@ def resolve_option(underlying: str, expiry: str, strike: float, side: str) -> di
                 and r.get("instrument_type") == side):
             log_h2(f"{side} instrument resolved: {underlying} {expiry} {strike} -> token {r['instrument_token']}")
             return _slim(r)
-    log_h2_error(f"{side} instrument not found for {underlying} {expiry} {strike}")
+    log_h2_error(f"{side} instrument not found for {underlying} {expiry} {strike} (exchange={exchange})")
     return None
 
 
 def resolve_chain(underlying: str, expiry: str) -> list[dict]:
     """All strikes for underlying/expiry with CE + PE tokens paired up."""
     underlying = underlying.upper()
+    exchange = _option_exchange(underlying)
     try:
-        rows = _load("NFO")
+        rows = _load(exchange)
     except Exception as e:
         log_h2_error(f"Option chain resolution failed for {underlying}: {e}")
         return []
@@ -131,8 +181,9 @@ def resolve_chain(underlying: str, expiry: str) -> list[dict]:
 
 def list_expiries(underlying: str) -> list[str]:
     underlying = underlying.upper()
+    exchange = _option_exchange(underlying)
     try:
-        rows = _load("NFO")
+        rows = _load(exchange)
     except Exception as e:
         log_h2_error(f"Expiry list failed for {underlying}: {e}")
         return []
