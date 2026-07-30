@@ -19,6 +19,9 @@ ENV/
 # Environment variables - NEVER commit this
 .env
 
+# Zerodha session cache (History 2) - contains a live access token
+backend/history2/.zerodha_session.json
+
 # IDE
 .vscode/
 .idea/
