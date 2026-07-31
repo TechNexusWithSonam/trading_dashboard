@@ -2,13 +2,19 @@
 start_feed()/periodic_refresh() pair in backend/main.py, but for History 2.
 
 Runs entirely independent of any connected browser client: once Zerodha is
-authenticated, it computes ATM/ITM-1/ITM-2 CE+PE strikes per watchlist symbol
+authenticated, it computes ATM/ITM-2 CE+PE strikes per watchlist symbol
 from live spot price (via the shared broker-independent backend/strike_calc.py
 — the same math Upstox uses), resolves their instrument tokens, subscribes
 them on the shared ticker2, and registers them with history.py so
 minute-bucketed rows get recorded continuously. This is what makes History 2
 "just work" without anyone opening the page — matching how Upstox's History
 already behaves (backend/main.py's on_startup() -> start_feed()).
+
+Only ITM-2 CE/PE is tracked here (not ITM-1) — a deliberate product decision
+to keep History 2's own display and Zerodha token footprint limited to what
+it actually shows; strike_calc.get_itm_strikes still supports any level and
+Upstox's History page separately tracks both ITM-1 and ITM-2 via its own
+(unrelated) loc_engine.py code path.
 
 Isolated from the manual per-page Symbol/Expiry/Strike flow in routes.py /
 History2.jsx, which is untouched and keeps working exactly as before for
@@ -94,7 +100,7 @@ async def start():
 
 async def _resolve_all_and_subscribe():
     """Initial pass: resolve every watchlist symbol's spot instrument, fetch
-    all spot LTPs in one batched REST call, then compute+resolve ITM-1/ITM-2
+    all spot LTPs in one batched REST call, then compute+resolve ITM-2
     strikes per symbol and subscribe everything on the ticker."""
     spot_by_symbol: dict[str, dict] = {}
     for sym in WATCHLIST:
@@ -149,48 +155,46 @@ async def _batched_ltp(keys: list[str]) -> dict:
 
 
 def _resolve_and_register_strikes(sym: str, tracking: '_SymbolTracking', spot_ltp: float) -> list[int]:
-    """Compute ITM-1/ITM-2 CE+PE strikes from spot_ltp, resolve their Zerodha
+    """Compute ITM-2 CE+PE strikes from spot_ltp, resolve their Zerodha
     instrument tokens, store the strikes in state2.symbol_meta and the tokens
     in state2.symbol_context (merged, not replacing the manual-subscribe
     roles), and return the resolved option tokens to subscribe."""
     atm = get_atm_strike(spot_ltp, sym)
     tracking.last_atm = atm
-    itm1_ce_strike, itm1_pe_strike = get_itm_strikes(spot_ltp, sym, 1)
+    # ITM-1 intentionally NOT resolved/subscribed for History 2 — Upstox's
+    # History page still shows it, but History 2 only tracks ITM-2 CE/PE
+    # (product decision: keep History 2's Zerodha token footprint to what's
+    # actually displayed). get_itm_strikes/instr.resolve_option are untouched
+    # shared functions — this only changes what this engine calls them for.
     itm2_ce_strike, itm2_pe_strike = get_itm_strikes(spot_ltp, sym, 2)
 
-    itm1_ce = instr.resolve_option(sym, tracking.expiry, itm1_ce_strike, "CE")
-    itm1_pe = instr.resolve_option(sym, tracking.expiry, itm1_pe_strike, "PE")
     itm2_ce = instr.resolve_option(sym, tracking.expiry, itm2_ce_strike, "CE")
     itm2_pe = instr.resolve_option(sym, tracking.expiry, itm2_pe_strike, "PE")
 
-    if not (itm1_ce and itm1_pe and itm2_ce and itm2_pe):
-        log_h2_error(f"History2 engine: {sym} — could not resolve all ITM1/ITM2 option "
+    if not (itm2_ce and itm2_pe):
+        log_h2_error(f"History2 engine: {sym} — could not resolve ITM2 option "
                       f"contracts for expiry {tracking.expiry} (spot={spot_ltp}, atm={atm}); skipped this cycle")
         return []
 
     state2.symbol_meta[sym] = {
-        "itm1_ce_strike": itm1_ce_strike, "itm1_pe_strike": itm1_pe_strike,
         "itm2_ce_strike": itm2_ce_strike, "itm2_pe_strike": itm2_pe_strike,
         "last_atm": atm, "expiry": tracking.expiry,
     }
     register_context(
         sym,
         spot_token=tracking.spot_token,
-        itm1_ce_token=itm1_ce["instrumentToken"], itm1_pe_token=itm1_pe["instrumentToken"],
         itm2_ce_token=itm2_ce["instrumentToken"], itm2_pe_token=itm2_pe["instrumentToken"],
     )
     log_h2(f"History2 engine: {sym} spot={spot_ltp} atm={atm} expiry={tracking.expiry} | "
-           f"ITM1 CE={itm1_ce_strike}(tok {itm1_ce['instrumentToken']}) PE={itm1_pe_strike}(tok {itm1_pe['instrumentToken']}) | "
            f"ITM2 CE={itm2_ce_strike}(tok {itm2_ce['instrumentToken']}) PE={itm2_pe_strike}(tok {itm2_pe['instrumentToken']})")
-    return [itm1_ce["instrumentToken"], itm1_pe["instrumentToken"],
-            itm2_ce["instrumentToken"], itm2_pe["instrumentToken"]]
+    return [itm2_ce["instrumentToken"], itm2_pe["instrumentToken"]]
 
 
 async def _recheck_atm_shifts():
     """Periodic (60s) pass: for each tracked symbol, read its latest spot
     price from state2.live_ticks (already flowing — spot tokens are
-    subscribed) and recompute ATM. On a genuine shift, resolve new ITM-1/
-    ITM-2 tokens, subscribe them, and unsubscribe the superseded ones — this
+    subscribed) and recompute ATM. On a genuine shift, resolve new ITM-2
+    tokens, subscribe them, and unsubscribe the superseded ones — this
     explicitly ports the ce_pe_ltp_freeze_fix lesson from the Upstox side
     (unbounded subscription growth from never unsubscribing superseded
     strikes) so the same class of bug isn't reintroduced here."""
@@ -207,7 +211,7 @@ async def _recheck_atm_shifts():
         if new_atm == tracking.last_atm:
             continue
         prev_ctx = dict(state2.symbol_context.get(sym, {}))
-        prev_itm_tokens = [prev_ctx.get(r) for r in ("itm1_ce", "itm1_pe", "itm2_ce", "itm2_pe")]
+        prev_itm_tokens = [prev_ctx.get(r) for r in ("itm2_ce", "itm2_pe")]
         tokens = _resolve_and_register_strikes(sym, tracking, spot_ltp)
         if not tokens:
             continue
