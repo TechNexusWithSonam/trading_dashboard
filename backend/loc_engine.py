@@ -10,7 +10,7 @@ loc_engine.py v11 — Complete rewrite fixing:
 import asyncio, time
 from dataclasses import dataclass, field
 from typing import Optional, Callable, Dict
-from .instruments import get_itm2_strikes, STRIKE_STEPS
+from .instruments import get_itm2_strikes, get_itm1_strikes, STRIKE_STEPS
 
 
 @dataclass
@@ -44,6 +44,10 @@ class SymbolState:
     ce:OptionData=field(default_factory=OptionData)
     pe:OptionData=field(default_factory=OptionData)
     ce_strike:float=0; pe_strike:float=0
+    # 1st ITM strikes/data — additive alongside the ce/pe (2nd ITM) pair above.
+    itm1_ce:OptionData=field(default_factory=OptionData)
+    itm1_pe:OptionData=field(default_factory=OptionData)
+    itm1_ce_strike:float=0; itm1_pe_strike:float=0
     expiry:str=""
     option_chain:dict=field(default_factory=dict)
     loc_result:dict=field(default_factory=dict)
@@ -201,12 +205,13 @@ class LOCEngine:
         if new_atm != st.last_atm:
             st.last_atm = new_atm
             ce_s, pe_s = get_itm2_strikes(ltp, symbol)
+            itm1_ce_s, itm1_pe_s = get_itm1_strikes(ltp, symbol)
             if ce_s != st.ce_strike or pe_s != st.pe_strike:
                 prev_ce_key = st.ce.instrument_key
                 prev_pe_key = st.pe.instrument_key
                 st.ce_strike = ce_s
                 st.pe_strike = pe_s
-                print(f"[LOC] {symbol} ATM shift→{new_atm} CE:{ce_s} PE:{pe_s}")
+                print(f"[LOC] {symbol} ATM shift→{new_atm} CE:{ce_s} PE:{pe_s} (ITM1 CE:{itm1_ce_s} PE:{itm1_pe_s})")
                 # Load from cached chain so the new strike's instrument_key is set.
                 self._load_from_chain(symbol)
                 # If the instrument key actually changed, push the new WS
@@ -218,6 +223,17 @@ class LOCEngine:
                 if keys_changed and self.on_option_keys_changed:
                     asyncio.create_task(self.on_option_keys_changed())
                 asyncio.create_task(self._refresh_chain(symbol, force=keys_changed))
+            if itm1_ce_s != st.itm1_ce_strike or itm1_pe_s != st.itm1_pe_strike:
+                prev_itm1_ce_key = st.itm1_ce.instrument_key
+                prev_itm1_pe_key = st.itm1_pe.instrument_key
+                st.itm1_ce_strike = itm1_ce_s
+                st.itm1_pe_strike = itm1_pe_s
+                self._load_itm1_from_chain(symbol)
+                itm1_keys_changed = (st.itm1_ce.instrument_key != prev_itm1_ce_key or
+                                      st.itm1_pe.instrument_key != prev_itm1_pe_key)
+                if itm1_keys_changed and self.on_option_keys_changed:
+                    asyncio.create_task(self.on_option_keys_changed())
+                asyncio.create_task(self._refresh_chain(symbol, force=itm1_keys_changed))
         self._recalc(symbol)
         # Calculator parallel tracking — mirror the ATM-shift logic against
         # calc_state.last_atm if the user has a Calculator view open on
@@ -287,6 +303,33 @@ class LOCEngine:
             opt.close = close
         self._recalc(symbol)
 
+    def update_itm1_option_from_feed(self, symbol:str, opt_type:str,
+                                      ltp:float, close:float, high:float, low:float):
+        """Real-time CE/PE price update from WS feed for the 1st-ITM pair.
+        Mirrors update_option_from_feed exactly, writing into itm1_ce/itm1_pe
+        instead of ce/pe — kept as a separate method (not a shared branch)
+        so the two pairs' OptionData targets can never be confused."""
+        st=self.symbols.get(symbol)
+        if not st: return
+        opt = st.itm1_ce if opt_type=="CE" else st.itm1_pe
+        if ltp and ltp>0:
+            opt.ltp = ltp
+            if high > 0:
+                opt.high = high
+            elif opt.high > 0:
+                opt.high = max(opt.high, ltp)
+            else:
+                opt.high = ltp
+            if low > 0:
+                opt.low = low
+            elif opt.low > 0:
+                opt.low = min(opt.low, ltp)
+            else:
+                opt.low = ltp
+        if close and close>0 and not opt.close:
+            opt.close = close
+        self._recalc(symbol)
+
     def update_chain(self, symbol:str, chain:dict):
         """Called after fresh chain fetch. Extracts spot and sets ITM-2 strikes."""
         st=self.symbols.get(symbol)
@@ -318,6 +361,9 @@ class LOCEngine:
             ce_s, pe_s = get_itm2_strikes(effective_spot, symbol)
             st.ce_strike = ce_s
             st.pe_strike = pe_s
+            itm1_ce_s, itm1_pe_s = get_itm1_strikes(effective_spot, symbol)
+            st.itm1_ce_strike = itm1_ce_s
+            st.itm1_pe_strike = itm1_pe_s
             step = STRIKE_STEPS.get(symbol.upper(), 50)
             st.last_atm  = round(round(effective_spot / step) * step, 2)
 
@@ -327,17 +373,24 @@ class LOCEngine:
                 st.spot.close = chain_spot
 
         self._load_from_chain(symbol)
+        self._load_itm1_from_chain(symbol)
 
-    def _load_from_chain(self, symbol:str):
-        """Load CE/PE data from chain at the ITM-2 strikes."""
+    def _load_strikes_from_chain(self, symbol:str, ce_strike:float, pe_strike:float,
+                                  ce_opt:'OptionData', pe_opt:'OptionData', label:str='ITM2'):
+        """Shared chain-lookup logic for a CE/PE strike pair: nearest-strike
+        fallback when the exact strike isn't in the chain, MCX-illiquid jump
+        to the nearest non-zero-LTP strike, and field mapping into the given
+        OptionData targets. Used identically by the ITM-2 (ce/pe) and ITM-1
+        (itm1_ce/itm1_pe) pairs so both get exactly the same correctness
+        guarantees. Returns the (possibly nearest-strike-adjusted) strikes."""
         st=self.symbols.get(symbol)
-        if not st or not st.option_chain: return
-        if not st.ce_strike:
-            print(f"[LOC] {symbol}: no strikes set, skipping chain load")
-            return
+        if not st or not st.option_chain: return ce_strike, pe_strike
+        if not ce_strike:
+            print(f"[LOC] {symbol}: no {label} strikes set, skipping chain load")
+            return ce_strike, pe_strike
 
-        ce_row = st.option_chain.get(st.ce_strike, {})
-        pe_row = st.option_chain.get(st.pe_strike, {})
+        ce_row = st.option_chain.get(ce_strike, {})
+        pe_row = st.option_chain.get(pe_strike, {})
 
         strikes = sorted(st.option_chain.keys())
         step = STRIKE_STEPS.get(symbol.upper(), 50)
@@ -346,38 +399,38 @@ class LOCEngine:
             # Strikes not in chain — find nearest available strikes
             tolerance = step * 4
             if strikes:
-                nearest_ce = min(strikes, key=lambda s: abs(s - st.ce_strike))
-                nearest_pe = min(strikes, key=lambda s: abs(s - st.pe_strike))
-                if abs(nearest_ce - st.ce_strike) < tolerance:
+                nearest_ce = min(strikes, key=lambda s: abs(s - ce_strike))
+                nearest_pe = min(strikes, key=lambda s: abs(s - pe_strike))
+                if abs(nearest_ce - ce_strike) < tolerance:
                     ce_row = st.option_chain.get(nearest_ce, {})
-                    if ce_row: st.ce_strike = nearest_ce
-                if abs(nearest_pe - st.pe_strike) < tolerance:
+                    if ce_row: ce_strike = nearest_ce
+                if abs(nearest_pe - pe_strike) < tolerance:
                     pe_row = st.option_chain.get(nearest_pe, {})
-                    if pe_row: st.pe_strike = nearest_pe
+                    if pe_row: pe_strike = nearest_pe
 
-        # MCX options are illiquid at ITM-2 — fall back to nearest strike
+        # MCX options are illiquid at ITM strikes — fall back to nearest strike
         # with non-zero LTP so the LOC engine has real data to work with.
         # Only jump to a different strike when BOTH ltp AND close are zero.
-        # If close > 0 (prev-day settlement), the ITM-2 strike is valid and
+        # If close > 0 (prev-day settlement), the ITM strike is valid and
         # we must not replace pe_strike with a different strike in the history.
         if strikes:
             ce_ltp   = float((ce_row.get("CE") or {}).get("ltp",   0) or 0)
             ce_close = float((ce_row.get("CE") or {}).get("close", 0) or 0)
             if ce_ltp == 0 and ce_close == 0:
-                for s in sorted(strikes, key=lambda x: abs(x - st.ce_strike)):
+                for s in sorted(strikes, key=lambda x: abs(x - ce_strike)):
                     row = st.option_chain.get(s, {})
                     if float((row.get("CE") or {}).get("ltp", 0) or 0) > 0:
                         ce_row = row
-                        st.ce_strike = s
+                        ce_strike = s
                         break
             pe_ltp   = float((pe_row.get("PE") or {}).get("ltp",   0) or 0)
             pe_close = float((pe_row.get("PE") or {}).get("close", 0) or 0)
             if pe_ltp == 0 and pe_close == 0:
-                for s in sorted(strikes, key=lambda x: abs(x - st.pe_strike)):
+                for s in sorted(strikes, key=lambda x: abs(x - pe_strike)):
                     row = st.option_chain.get(s, {})
                     if float((row.get("PE") or {}).get("ltp", 0) or 0) > 0:
                         pe_row = row
-                        st.pe_strike = s
+                        pe_strike = s
                         break
 
         def _best(*vals):
@@ -390,76 +443,100 @@ class LOCEngine:
 
         # Every chain refresh gets today's authoritative prev-close + session
         # high/low from Upstox. Overwrite directly — the old max/min
-        # accumulation and `not st.pe.close` guard caused yesterday's values
+        # accumulation and `not opt.close` guard caused yesterday's values
         # to persist into today's session whenever today's numbers were
         # smaller or a close had already been seeded.
         if ce_row.get("CE"):
             c = ce_row["CE"]
             new_ce_key = c.get("key", "")
-            key_changed = (new_ce_key and new_ce_key != st.ce.instrument_key)
+            key_changed = (new_ce_key and new_ce_key != ce_opt.instrument_key)
             chain_ltp   = _best(c.get("ltp"), c.get("close"))
             chain_close = _best(c.get("close"), c.get("ltp"))
             # Only overwrite LTP from chain if instrument changed (ATM shift)
             # or we have no WS data yet. WS LTP is real-time and authoritative.
-            if key_changed or not st.ce.ltp:
-                st.ce.ltp = chain_ltp
+            if key_changed or not ce_opt.ltp:
+                ce_opt.ltp = chain_ltp
             # Close: chain close_price is prev day's close for NSE, net_change-
             # derived for MCX. Always refresh when chain returns a value.
             if chain_close:
-                st.ce.close = chain_close
+                ce_opt.close = chain_close
             # High/low: chain reports today's session extremes. Overwrite when
             # the chain has a value; fall back to ltp only when both chain is
             # empty and we have no prior high/low (first-load or ATM shift).
             chain_high = _best(c.get("high"))
             chain_low  = _best(c.get("low"))
             if chain_high:
-                st.ce.high = chain_high
-            elif key_changed or not st.ce.high:
-                st.ce.high = chain_ltp
+                ce_opt.high = chain_high
+            elif key_changed or not ce_opt.high:
+                ce_opt.high = chain_ltp
             if chain_low:
-                st.ce.low = chain_low
-            elif key_changed or not st.ce.low:
-                st.ce.low = chain_ltp
-            st.ce.oi    = float(c.get("oi") or 0)
-            st.ce.iv    = float(c.get("iv") or 0)
-            st.ce.instrument_key = new_ce_key or st.ce.instrument_key
+                ce_opt.low = chain_low
+            elif key_changed or not ce_opt.low:
+                ce_opt.low = chain_ltp
+            ce_opt.oi    = float(c.get("oi") or 0)
+            ce_opt.iv    = float(c.get("iv") or 0)
+            ce_opt.instrument_key = new_ce_key or ce_opt.instrument_key
 
         if pe_row.get("PE"):
             p = pe_row["PE"]
             new_pe_key = p.get("key", "")
-            key_changed = (new_pe_key and new_pe_key != st.pe.instrument_key)
+            key_changed = (new_pe_key and new_pe_key != pe_opt.instrument_key)
             chain_ltp   = _best(p.get("ltp"), p.get("close"))
             chain_close = _best(p.get("close"), p.get("ltp"))
-            if key_changed or not st.pe.ltp:
-                st.pe.ltp = chain_ltp
+            if key_changed or not pe_opt.ltp:
+                pe_opt.ltp = chain_ltp
             if chain_close:
-                st.pe.close = chain_close
+                pe_opt.close = chain_close
             chain_high = _best(p.get("high"))
             chain_low  = _best(p.get("low"))
             if chain_high:
-                st.pe.high = chain_high
-            elif key_changed or not st.pe.high:
-                st.pe.high = chain_ltp
+                pe_opt.high = chain_high
+            elif key_changed or not pe_opt.high:
+                pe_opt.high = chain_ltp
             if chain_low:
-                st.pe.low = chain_low
-            elif key_changed or not st.pe.low:
-                st.pe.low = chain_ltp
-            st.pe.oi    = float(p.get("oi") or 0)
-            st.pe.iv    = float(p.get("iv") or 0)
-            st.pe.instrument_key = new_pe_key or st.pe.instrument_key
+                pe_opt.low = chain_low
+            elif key_changed or not pe_opt.low:
+                pe_opt.low = chain_ltp
+            pe_opt.oi    = float(p.get("oi") or 0)
+            pe_opt.iv    = float(p.get("iv") or 0)
+            pe_opt.instrument_key = new_pe_key or pe_opt.instrument_key
 
-        print(f"[LOC] {symbol} loaded: "
-              f"CE@{st.ce_strike}=ltp:{st.ce.ltp} close:{st.ce.close} "
-              f"eff:{st.ce.effective_ltp} "
-              f"key:{st.ce.instrument_key[:20] if st.ce.instrument_key else 'MISS'} | "
-              f"PE@{st.pe_strike}=ltp:{st.pe.ltp} close:{st.pe.close} "
-              f"eff:{st.pe.effective_ltp} "
-              f"key:{st.pe.instrument_key[:20] if st.pe.instrument_key else 'MISS'}")
+        print(f"[LOC] {symbol} {label} loaded: "
+              f"CE@{ce_strike}=ltp:{ce_opt.ltp} close:{ce_opt.close} "
+              f"eff:{ce_opt.effective_ltp} "
+              f"key:{ce_opt.instrument_key[:20] if ce_opt.instrument_key else 'MISS'} | "
+              f"PE@{pe_strike}=ltp:{pe_opt.ltp} close:{pe_opt.close} "
+              f"eff:{pe_opt.effective_ltp} "
+              f"key:{pe_opt.instrument_key[:20] if pe_opt.instrument_key else 'MISS'}")
+        return ce_strike, pe_strike
+
+    def _load_from_chain(self, symbol:str):
+        """Load CE/PE data from chain at the ITM-2 strikes."""
+        st=self.symbols.get(symbol)
+        if not st or not st.option_chain: return
+        if not st.ce_strike:
+            print(f"[LOC] {symbol}: no strikes set, skipping chain load")
+            return
+        st.ce_strike, st.pe_strike = self._load_strikes_from_chain(
+            symbol, st.ce_strike, st.pe_strike, st.ce, st.pe, label='ITM2')
         # Seed tick timestamps so REST fallback waits 30s after each chain load
         # before assuming the key is silent (gives WS feed a chance to deliver)
         now = time.time()
         st.ce_last_tick = now
         st.pe_last_tick = now
+        self._recalc(symbol)
+
+    def _load_itm1_from_chain(self, symbol:str):
+        """Load CE/PE data from chain at the ITM-1 strikes. Additive sibling
+        of _load_from_chain — does not touch ce_last_tick/pe_last_tick (those
+        stay scoped to the ITM-2 pair the stale-option REST monitor tracks)."""
+        st=self.symbols.get(symbol)
+        if not st or not st.option_chain: return
+        if not st.itm1_ce_strike:
+            print(f"[LOC] {symbol}: no ITM1 strikes set, skipping chain load")
+            return
+        st.itm1_ce_strike, st.itm1_pe_strike = self._load_strikes_from_chain(
+            symbol, st.itm1_ce_strike, st.itm1_pe_strike, st.itm1_ce, st.itm1_pe, label='ITM1')
         self._recalc(symbol)
 
     def _recalc(self, symbol:str):
@@ -501,6 +578,19 @@ class LOCEngine:
             "pe_low":    round(st.pe.effective_low, 2),
             "ce_iv":     round(st.ce.iv, 2),
             "pe_iv":     round(st.pe.iv, 2),
+            # 1st ITM pair — additive, does not alter any key above (2nd ITM).
+            "itm1_ce_strike": st.itm1_ce_strike,
+            "itm1_pe_strike": st.itm1_pe_strike,
+            "itm1_ce_ltp":    round(st.itm1_ce.effective_ltp, 2),
+            "itm1_pe_ltp":    round(st.itm1_pe.effective_ltp, 2),
+            "itm1_ce_close":  round(st.itm1_ce.close, 2),
+            "itm1_pe_close":  round(st.itm1_pe.close, 2),
+            "itm1_ce_high":   round(st.itm1_ce.effective_high, 2),
+            "itm1_ce_low":    round(st.itm1_ce.effective_low, 2),
+            "itm1_pe_high":   round(st.itm1_pe.effective_high, 2),
+            "itm1_pe_low":    round(st.itm1_pe.effective_low, 2),
+            "itm1_ce_iv":     round(st.itm1_ce.iv, 2),
+            "itm1_pe_iv":     round(st.itm1_pe.iv, 2),
             "ts":        int(time.time() * 1000),
         })
         st.loc_result = res
@@ -540,6 +630,13 @@ class LOCEngine:
         for st in self.symbols.values():
             if st.ce.instrument_key: keys.append(st.ce.instrument_key)
             if st.pe.instrument_key: keys.append(st.pe.instrument_key)
+        return [k for k in keys if k]
+
+    def get_itm1_option_keys(self) -> list:
+        keys = []
+        for st in self.symbols.values():
+            if st.itm1_ce.instrument_key: keys.append(st.itm1_ce.instrument_key)
+            if st.itm1_pe.instrument_key: keys.append(st.itm1_pe.instrument_key)
         return [k for k in keys if k]
 
     # ── Calculator-only API (decoupled from LOC table) ─────────────────

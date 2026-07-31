@@ -76,7 +76,8 @@ SPOT_KEYS_D: dict = {}   # filled at startup
 
 # Feed key → LOC symbol (for routing to LOC engine)
 FEED_KEY_TO_SYM: dict = {}
-option_key_map:      dict = {}   # LOC option key → (symbol, "CE"/"PE")
+option_key_map:      dict = {}   # LOC option key (ITM-2) → (symbol, "CE"/"PE")
+itm1_option_key_map: dict = {}   # LOC option key (ITM-1) → (symbol, "CE"/"PE")
 calc_option_key_map: dict = {}   # Calculator option key → (symbol, "CE"/"PE")
 option_key_last_tick: dict = {}  # instrument_key → last WS tick timestamp (for stale detection)
 _OPTION_KEY_MAX_AGE = 3600  # prune entries older than 1 hour to prevent unbounded growth
@@ -402,7 +403,8 @@ def _record_loc_hist(sym, loc):
             "call_cp_diff","put_cp_diff",
             "zone","change","direction","different",
             "call_cp_diff","put_cp_diff",
-            "ce_strike","pe_strike","ce_ltp","pe_ltp","ce_iv","pe_iv"]
+            "ce_strike","pe_strike","ce_ltp","pe_ltp","ce_iv","pe_iv",
+            "itm1_ce_strike","itm1_pe_strike","itm1_ce_ltp","itm1_pe_ltp","itm1_ce_iv","itm1_pe_iv"]
     hist.insert(0, {"ts":int(time.time()*1000), **{k:loc[k] for k in keep if k in loc}})
     if len(hist) > 200: hist.pop()
 
@@ -436,6 +438,26 @@ def _route_tick(key, ltp, cp, o, h, l, ts):
             else:
                 loc_engine.update_option_from_feed(sym_m, opt_type, ltp, cp, h, l)
                 option_key_last_tick[key] = time.time()  # record live tick for stale detection
+    # ── LOC ITM-1 option routing (parallel, decoupled from ITM-2 above) ──
+    itm1_mapping = itm1_option_key_map.get(key)
+    if not itm1_mapping:
+        for st in loc_engine.symbols.values():
+            if st.itm1_ce.instrument_key == key:
+                itm1_mapping = (st.symbol, "CE"); break
+            if st.itm1_pe.instrument_key == key:
+                itm1_mapping = (st.symbol, "PE"); break
+        if itm1_mapping:
+            itm1_option_key_map[key] = itm1_mapping
+    if itm1_mapping:
+        sym_i, opt_type_i = itm1_mapping
+        st = loc_engine.get_state(sym_i)
+        if st:
+            cur_i = st.itm1_ce.instrument_key if opt_type_i == "CE" else st.itm1_pe.instrument_key
+            if key != cur_i:
+                itm1_option_key_map.pop(key, None)
+            else:
+                loc_engine.update_itm1_option_from_feed(sym_i, opt_type_i, ltp, cp, h, l)
+                option_key_last_tick[key] = time.time()
     # ── Calculator option routing (parallel, decoupled from LOC) ───
     cmap = calc_option_key_map.get(key)
     if not cmap:
@@ -760,8 +782,9 @@ async def _refresh_calc_option_ohlc(symbol: str):
 async def _subscribe_new_option_keys():
     if not state.upstox_ws: return
     loc_keys  = [k for k in loc_engine.get_option_keys() if k]
+    itm1_keys = [k for k in loc_engine.get_itm1_option_keys() if k]
     calc_keys = [k for k in loc_engine.get_calc_option_keys() if k]
-    all_keys  = list(dict.fromkeys(loc_keys + calc_keys))
+    all_keys  = list(dict.fromkeys(loc_keys + itm1_keys + calc_keys))
     all_keys_set = set(all_keys)
     new_keys  = [k for k in all_keys if k not in state.subscribed_option_keys]
     # get_option_keys()/get_calc_option_keys() only ever return each symbol's
@@ -805,6 +828,10 @@ async def _subscribe_new_option_keys():
     for st in loc_engine.symbols.values():
         if st.ce.instrument_key: option_key_map[st.ce.instrument_key] = (st.symbol,"CE")
         if st.pe.instrument_key: option_key_map[st.pe.instrument_key] = (st.symbol,"PE")
+    itm1_option_key_map.clear()
+    for st in loc_engine.symbols.values():
+        if st.itm1_ce.instrument_key: itm1_option_key_map[st.itm1_ce.instrument_key] = (st.symbol,"CE")
+        if st.itm1_pe.instrument_key: itm1_option_key_map[st.itm1_pe.instrument_key] = (st.symbol,"PE")
     calc_option_key_map.clear()
     for sn, calc in loc_engine.calc_states.items():
         if calc.ce.instrument_key: calc_option_key_map[calc.ce.instrument_key] = (sn,"CE")
@@ -1710,24 +1737,30 @@ async def start_feed():
                     await _sub_binary(ws, stock_keys[i:i+100], "full")
                     await asyncio.sleep(0.3)
 
-                # 4. Option CE/PE keys from chain
-                opt_keys = loc_engine.get_option_keys()
-                if opt_keys:
-                    await _sub_binary(ws, opt_keys, "full")
-                    state.subscribed_option_keys.update(opt_keys)
+                # 4. Option CE/PE keys from chain (ITM-2, plus additive ITM-1)
+                opt_keys  = loc_engine.get_option_keys()
+                itm1_keys = loc_engine.get_itm1_option_keys()
+                all_opt_keys = list(dict.fromkeys(opt_keys + itm1_keys))
+                if all_opt_keys:
+                    await _sub_binary(ws, all_opt_keys, "full")
+                    state.subscribed_option_keys.update(all_opt_keys)
                     # Seed tick timestamps so stale monitor gives 30s grace
                     _now = time.time()
-                    for _k in opt_keys:
+                    for _k in all_opt_keys:
                         option_key_last_tick[_k] = _now
                     for st_sym in loc_engine.symbols.values():
                         if st_sym.ce.instrument_key:
                             option_key_map[st_sym.ce.instrument_key] = (st_sym.symbol,"CE")
                         if st_sym.pe.instrument_key:
                             option_key_map[st_sym.pe.instrument_key] = (st_sym.symbol,"PE")
+                        if st_sym.itm1_ce.instrument_key:
+                            itm1_option_key_map[st_sym.itm1_ce.instrument_key] = (st_sym.symbol,"CE")
+                        if st_sym.itm1_pe.instrument_key:
+                            itm1_option_key_map[st_sym.itm1_pe.instrument_key] = (st_sym.symbol,"PE")
 
                 print(f"[Feed] Subscribed: {len(INDEX_KEYS)} idx | "
                       f"{len(COMMODITY_KEYS)} mcx | {len(stock_keys)} stocks | "
-                      f"{len(opt_keys)} options")
+                      f"{len(all_opt_keys)} options ({len(opt_keys)} ITM2 + {len(itm1_keys)} ITM1)")
 
                 tick_n = 0
                 last_frame_ts = time.time()
@@ -2188,6 +2221,13 @@ async def on_startup():
 
     # Start stale-option monitor (Bug 1 fallback: REST fetch when WS tick absent)
     asyncio.create_task(_supervise("stale_option_monitor", _stale_option_monitor))
+
+    # History 2 (Zerodha) — autonomous background engine, independent of any
+    # frontend connection, mirroring Upstox's start_feed()/periodic_refresh()
+    # autonomy above. Waits internally for Zerodha auth before doing anything;
+    # supervised so a crash restarts it instead of silently stopping recording.
+    from .history2 import engine as _history2_engine
+    asyncio.create_task(_supervise("history2_engine", _history2_engine.start))
 
     asyncio.create_task(_delayed_startup())
 

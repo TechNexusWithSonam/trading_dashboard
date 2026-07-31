@@ -180,7 +180,13 @@ async def _broadcast(msg: dict):
 async def _on_tick(token: int, price: float, ts_ms: int):
     state2.live_ticks[token] = {"lastPrice": price, "timestamp": ts_ms}
     history.on_tick(token, price, ts_ms)  # minute-bucket history recording, if this token is registered to a symbol
-    await _broadcast({"type": "history2:tick", "instrumentToken": token, "lastPrice": price, "timestamp": ts_ms})
+    # Only broadcast to connected browser clients for tokens someone actually
+    # subscribed to via this WS (manual Symbol/Expiry/Strike flow). The
+    # autonomous engine (engine.py) subscribes ~200 symbols' worth of tokens
+    # purely for background recording — broadcasting all of those to every
+    # connected client would flood the browser with irrelevant ticks.
+    if token in state2.broadcast_tokens:
+        await _broadcast({"type": "history2:tick", "instrumentToken": token, "lastPrice": price, "timestamp": ts_ms})
 
 
 async def _on_status(status: str):
@@ -220,6 +226,7 @@ async def history2_ws(ws: WebSocket):
                     if not ticker2.kws:
                         ticker2.start(_on_tick, _on_status)
                     ticker2.subscribe(tokens, mode)
+                    state2.broadcast_tokens.update(tokens)
                     if ctx and ctx.get("symbol"):
                         history.register_context(ctx["symbol"], ctx.get("spotToken"), ctx.get("ceToken"), ctx.get("peToken"))
                     await ws.send_json({"type": "history2:status", "status": "subscribed", "instrumentTokens": tokens})
@@ -228,7 +235,21 @@ async def history2_ws(ws: WebSocket):
                     await ws.send_json({"type": "history2:error", "message": str(e)})
             elif mtype == "history2:unsubscribe":
                 tokens = msg.get("instrumentTokens", [])
+                # Note: a token can coincidentally belong to more than one
+                # owner (e.g. a user manually picks the exact strike the
+                # autonomous engine in engine.py already tracks as an ITM-1/
+                # ITM-2 leg for the same underlying — same Zerodha instrument
+                # token either way). Unconditionally unsubscribing here can
+                # therefore drop a token the engine still wants; that's
+                # self-healing on the engine's next ATM-shift cycle (it
+                # re-subscribes its current tokens whenever the strike set
+                # changes) and is far safer than trying to guess ownership
+                # from state2.symbol_context, whose manual-path entries only
+                # get refreshed by the *next* subscribe message — which can
+                # race this unsubscribe and make a false-positive "still
+                # needed" check block a real strike-switch cleanup instead.
                 ticker2.unsubscribe(tokens)
+                state2.broadcast_tokens.difference_update(tokens)
                 await ws.send_json({"type": "history2:status", "status": "unsubscribed", "instrumentTokens": tokens})
             else:
                 await ws.send_json({"type": "history2:error", "message": f"unknown message type {mtype}"})

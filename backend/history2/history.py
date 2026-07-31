@@ -10,20 +10,35 @@ from .state import state2
 MAX_ROWS = 200
 
 
-def register_context(symbol: str, spot_token: int | None, ce_token: int | None, pe_token: int | None):
-    """Tell the tick router which tokens make up a symbol's spot/CE/PE, so
-    on_tick() can attribute incoming ticks to a symbol's history row."""
+def register_context(symbol: str, spot_token: int | None = None, ce_token: int | None = None,
+                      pe_token: int | None = None, **extra_roles):
+    """Tell the tick router which tokens make up a symbol's roles, so
+    on_tick() can attribute incoming ticks to a symbol's history row.
+
+    Merges into any existing context for this symbol instead of replacing it
+    — the manual frontend subscribe (spot/ce/pe roles) and the autonomous
+    background engine (itm1_ce/itm1_pe/itm2_ce/itm2_pe roles, see engine.py)
+    both call this independently for the same symbol and must not clobber
+    each other's tokens. Pass extra roles as kwargs, e.g.
+    register_context("NIFTY", itm1_ce_token=123, itm2_pe_token=456) — the
+    trailing "_token" suffix is stripped to get the role name.
+    """
     symbol = symbol.upper()
-    state2.symbol_context[symbol] = {"spot": spot_token, "ce": ce_token, "pe": pe_token}
+    roles = {"spot": spot_token, "ce": ce_token, "pe": pe_token}
+    for k, v in extra_roles.items():
+        role = k[:-len("_token")] if k.endswith("_token") else k
+        roles[role] = v
+    roles = {k: v for k, v in roles.items() if v is not None}
+    state2.symbol_context.setdefault(symbol, {}).update(roles)
     state2.live_by_symbol.setdefault(symbol, {})
-    log_h2(f"Tracking context for {symbol}: spot={spot_token} ce={ce_token} pe={pe_token}")
+    log_h2(f"Tracking context for {symbol}: {roles}")
 
 
 def _roles_for_token(token: int) -> list[tuple[str, str]]:
     out = []
     for sym, ctx in state2.symbol_context.items():
-        for role in ("spot", "ce", "pe"):
-            if ctx.get(role) == token:
+        for role, tok in ctx.items():
+            if tok == token:
                 out.append((sym, role))
     return out
 
@@ -42,11 +57,22 @@ def _maybe_record(symbol: str, ts_ms: int):
         return
     state2.last_minute[symbol] = minute_bucket
     live = state2.live_by_symbol.get(symbol, {})
+    meta = state2.symbol_meta.get(symbol, {})
     row = {
         "ts": ts_ms,
         "spot_ltp": live.get("spot_ltp"),
+        # Legacy manual-strike pair (frontend Strike dropdown) — untouched.
         "ce_ltp": live.get("ce_ltp"),
         "pe_ltp": live.get("pe_ltp"),
+        # Autonomous engine's 1st/2nd ITM pairs — additive.
+        "itm1_ce_strike": meta.get("itm1_ce_strike"),
+        "itm1_pe_strike": meta.get("itm1_pe_strike"),
+        "itm1_ce_ltp": live.get("itm1_ce_ltp"),
+        "itm1_pe_ltp": live.get("itm1_pe_ltp"),
+        "itm2_ce_strike": meta.get("itm2_ce_strike"),
+        "itm2_pe_strike": meta.get("itm2_pe_strike"),
+        "itm2_ce_ltp": live.get("itm2_ce_ltp"),
+        "itm2_pe_ltp": live.get("itm2_pe_ltp"),
     }
     hist = state2.history.setdefault(symbol, [])
     hist.insert(0, row)

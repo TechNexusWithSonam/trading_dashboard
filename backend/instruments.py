@@ -10,6 +10,8 @@ import asyncio, time
 from datetime import date, timedelta
 import httpx
 
+from .strike_calc import STRIKE_STEPS, get_itm_strikes, get_itm1_strikes, get_itm2_strikes as _get_itm2_strikes
+
 UPSTOX_CONTRACTS  = "https://api.upstox.com/v2/option/contract"
 UPSTOX_CHAIN      = "https://api.upstox.com/v2/option/chain"
 UPSTOX_QUOTE_V2   = "https://api.upstox.com/v2/market-quote/quotes"
@@ -17,11 +19,6 @@ UPSTOX_OHLC_V3    = "https://api.upstox.com/v3/market-quote/ohlc"
 UPSTOX_OHLC_V2    = "https://api.upstox.com/v2/market-quote/ohlc"
 UPSTOX_INTRADAY   = "https://api.upstox.com/v3/historical-candle/intraday"
 
-STRIKE_STEPS = {
-    "NIFTY":50,"BANKNIFTY":100,"FINNIFTY":50,"MIDCPNIFTY":25,
-    "SENSEX":100,"BANKEX":100,"CRUDEOIL":50,"NATURALGAS":10,
-    "GOLD":100,"SILVER":1000,"COPPER":5,
-}
 MONTHLY_SYMBOLS = {"GOLD","SILVER","COPPER","CRUDEOIL","NATURALGAS"}
 
 _M = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
@@ -62,9 +59,7 @@ def get_spot_keys() -> dict:
     return keys
 
 def get_itm2_strikes(spot: float, symbol: str) -> tuple:
-    step = STRIKE_STEPS.get(symbol.upper(), 50)
-    atm  = round(round(spot / step) * step, 2)
-    return atm - 2*step, atm + 2*step
+    return _get_itm2_strikes(spot, symbol)
 
 def _h(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
