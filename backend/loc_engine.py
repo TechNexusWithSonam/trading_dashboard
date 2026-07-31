@@ -206,7 +206,17 @@ class LOCEngine:
             st.last_atm = new_atm
             ce_s, pe_s = get_itm2_strikes(ltp, symbol)
             itm1_ce_s, itm1_pe_s = get_itm1_strikes(ltp, symbol)
+            # Coalesce ITM-2 and ITM-1 into a single on_option_keys_changed()/
+            # _refresh_chain() dispatch per ATM shift instead of up to two —
+            # both strikes shift from the same spot tick almost every time, so
+            # firing the callback twice back-to-back just doubled load on the
+            # Upstox WS send path for no benefit (observed in production logs
+            # as an occasional unretrieved-task-exception when a transient
+            # keepalive hiccup landed on the second, redundant send).
+            any_keys_changed = False
+            any_strike_changed = False
             if ce_s != st.ce_strike or pe_s != st.pe_strike:
+                any_strike_changed = True
                 prev_ce_key = st.ce.instrument_key
                 prev_pe_key = st.pe.instrument_key
                 st.ce_strike = ce_s
@@ -214,26 +224,27 @@ class LOCEngine:
                 print(f"[LOC] {symbol} ATM shift→{new_atm} CE:{ce_s} PE:{pe_s} (ITM1 CE:{itm1_ce_s} PE:{itm1_pe_s})")
                 # Load from cached chain so the new strike's instrument_key is set.
                 self._load_from_chain(symbol)
-                # If the instrument key actually changed, push the new WS
-                # subscription immediately — don't wait up to 60 s for the
-                # periodic refresh. Also bypass the chain throttle so fresh
-                # LTP/close/high/low arrive as soon as possible.
-                keys_changed = (st.ce.instrument_key != prev_ce_key or
-                                st.pe.instrument_key != prev_pe_key)
-                if keys_changed and self.on_option_keys_changed:
-                    asyncio.create_task(self.on_option_keys_changed())
-                asyncio.create_task(self._refresh_chain(symbol, force=keys_changed))
+                if (st.ce.instrument_key != prev_ce_key or
+                        st.pe.instrument_key != prev_pe_key):
+                    any_keys_changed = True
             if itm1_ce_s != st.itm1_ce_strike or itm1_pe_s != st.itm1_pe_strike:
+                any_strike_changed = True
                 prev_itm1_ce_key = st.itm1_ce.instrument_key
                 prev_itm1_pe_key = st.itm1_pe.instrument_key
                 st.itm1_ce_strike = itm1_ce_s
                 st.itm1_pe_strike = itm1_pe_s
                 self._load_itm1_from_chain(symbol)
-                itm1_keys_changed = (st.itm1_ce.instrument_key != prev_itm1_ce_key or
-                                      st.itm1_pe.instrument_key != prev_itm1_pe_key)
-                if itm1_keys_changed and self.on_option_keys_changed:
+                if (st.itm1_ce.instrument_key != prev_itm1_ce_key or
+                        st.itm1_pe.instrument_key != prev_itm1_pe_key):
+                    any_keys_changed = True
+            if any_strike_changed:
+                # If any instrument key actually changed, push the new WS
+                # subscription immediately — don't wait up to 60 s for the
+                # periodic refresh. Also bypass the chain throttle so fresh
+                # LTP/close/high/low arrive as soon as possible.
+                if any_keys_changed and self.on_option_keys_changed:
                     asyncio.create_task(self.on_option_keys_changed())
-                asyncio.create_task(self._refresh_chain(symbol, force=itm1_keys_changed))
+                asyncio.create_task(self._refresh_chain(symbol, force=any_keys_changed))
         self._recalc(symbol)
         # Calculator parallel tracking — mirror the ATM-shift logic against
         # calc_state.last_atm if the user has a Calculator view open on
