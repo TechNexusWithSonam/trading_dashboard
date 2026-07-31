@@ -2226,8 +2226,16 @@ async def on_startup():
     # frontend connection, mirroring Upstox's start_feed()/periodic_refresh()
     # autonomy above. Waits internally for Zerodha auth before doing anything;
     # supervised so a crash restarts it instead of silently stopping recording.
-    from .history2 import engine as _history2_engine
-    asyncio.create_task(_supervise("history2_engine", _history2_engine.start))
+    #
+    # TEMPORARILY DISABLED (2026-07-31): its initial resolve pass makes
+    # ~200 synchronous (blocking) Zerodha SDK/instrument-scan calls with no
+    # asyncio.to_thread offload, which starves this single-threaded event
+    # loop and stalls the live Upstox feed for many minutes on every restart
+    # — observed in production (Upstox [Feed] frame count nearly flatlined
+    # for 30+ minutes post-deploy). Re-enable only after engine.py's blocking
+    # calls are moved off the event loop (see engine.py TODO).
+    # from .history2 import engine as _history2_engine
+    # asyncio.create_task(_supervise("history2_engine", _history2_engine.start))
 
     asyncio.create_task(_delayed_startup())
 
