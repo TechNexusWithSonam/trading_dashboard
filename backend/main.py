@@ -1,19 +1,20 @@
 """
-RAIMA Markets v9 — Complete Fixed Backend
-Key fixes from screenshots (all 0.00 showing):
-1. /v3/market-quote/ohlc used for initial snapshot (not v2)
-2. MCX key validation at startup — finds working month
-3. WS subscription as TEXT frame (not bytes)
-4. Option chain close_price field correct
-5. Full OHLC (open,high,low,close) fetched for CE/PE via REST
-6. Intraday candle API v3 for chart data
-7. Proper broadcast — attaches display_name to every stock tick
+RAIMA Markets v9 — Zerodha Kite Connect backend (migrated from Upstox)
+Key fixes from the original Upstox build, preserved through the migration:
+1. MCX key validation at startup — finds working month
+2. Option chain close_price field correct
+3. Full OHLC (open,high,low,close) fetched for CE/PE via REST
+4. Proper broadcast — attaches display_name to every stock tick
+
+Market data now comes from Zerodha Kite Connect instead of Upstox — see
+backend/instruments.py and the shared session in backend/history2/
+(zerodha_client.py, ticker.py) for the provider-layer details. Business
+logic (LOC formulas, routes, response shapes) is unchanged.
 """
-import asyncio, inspect, json, os, time, struct as _struct
+import asyncio, json, os, time
 from pathlib import Path
 from typing import Set
-from urllib.parse import urlencode
-import httpx, websockets
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,8 +28,13 @@ app = FastAPI(title="RAIMA Markets v9")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
-# History 2 — isolated Zerodha-backed module, does not touch LOC/Upstox state.
+# History 2 — shares this same Zerodha session/ticker with the LOC engine
+# below (see backend/history2/zerodha_client.py, ticker.py); does not touch
+# LOC state directly.
 from .history2.routes import router as _history2_router, zerodha_router as _history2_zerodha_router
+from .history2 import zerodha_client as zc
+from .history2.state import state2
+from .history2.ticker import ticker2
 app.include_router(_history2_router)
 app.include_router(_history2_zerodha_router)
 
@@ -36,20 +42,21 @@ FRONTEND_DIST   = Path(__file__).parent.parent / "frontend" / "dist"
 FRONTEND_STATIC = Path(__file__).parent.parent / "frontend" / "static"
 FRONTEND_STATIC.mkdir(parents=True, exist_ok=True)
 
-API_KEY      = os.getenv("UPSTOX_API_KEY", "")
-API_SECRET   = os.getenv("UPSTOX_API_SECRET", "")
-REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "http://localhost:8000/auth/callback")
-ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "")
-FEED_URL     = "wss://api.upstox.com/v3/feed/market-data-feed"
+# Zerodha Kite Connect app credentials — same shared app as History 2 (see
+# zerodha_client.API_KEY/API_SECRET). ACCESS_TOKEN seeds from a restored
+# disk-cached session if one exists (zerodha_client._restore_session_cache()
+# runs at import time, above, before this line executes).
+ACCESS_TOKEN = state2.access_token or ""
 PASSWORD     = os.getenv("DASHBOARD_PASSWORD", "raima2024")
 
 from .instruments import (
     get_spot_keys, mcx_key, mcx_key_for_month, get_current_and_next_expiry, get_itm2_strikes,
     fetch_expiry_list, fetch_option_chain, fetch_quotes_rest, fetch_index_quotes,
-    fetch_option_ohlc_rest, fetch_intraday_candles,
+    fetch_option_ohlc_rest, fetch_intraday_candles, fetch_historical_candles,
     validate_mcx_keys, calculate_expiries_fallback,
     normalize_mcx_response_key, normalize_response_key,
     refresh_nse_eq_keys, refresh_mcx_option_underlying,
+    token_to_key, key_to_token,
     STRIKE_STEPS, MONTHLY_SYMBOLS, _is_past_market_close_ist, _is_past_mcx_close_ist
 )
 from . import instruments as _instruments_mod
@@ -84,232 +91,37 @@ _OPTION_KEY_MAX_AGE = 3600  # prune entries older than 1 hour to prevent unbound
 
 
 # ══════════════════════════════════════════════════════════════════
-#  PROTO DECODER
+#  ZERODHA TICK ADAPTER
+#  Converts KiteTicker's on_ticks payload into the same {"ltpc","efeed"}
+#  shape the rest of this file (broadcast, _route_tick, _ex, _update_ohlc,
+#  loc_engine) already expects — so everything downstream of this adapter
+#  is unchanged from the Upstox version. Replaces the old protobuf decoder
+#  entirely (Zerodha's ticker delivers already-parsed Python dicts, no wire
+#  format to decode here).
 # ══════════════════════════════════════════════════════════════════
-def _rv(b, p):
-    r = 0; s = 0
-    while p < len(b):
-        x = b[p]; p += 1; r |= (x & 127) << s
-        if not (x & 128): break
-        s += 7
-    return r, p
+async def _on_zerodha_tick(token: int, price: float, ts_ms: int):
+    key = _instruments_mod.token_to_key(token)
+    if not key:
+        return
+    full = ticker2.last_full_tick.get(token) or {}
+    ohlc = full.get("ohlc") or {}
+    cp = float(ohlc.get("close") or 0)
+    feed = {
+        "ltpc": {"ltp": price, "cp": cp},
+        "efeed": {
+            "ltp": price, "cp": cp,
+            "open": float(ohlc.get("open") or price),
+            "high": float(ohlc.get("high") or price),
+            "low":  float(ohlc.get("low") or price),
+            "oi":   float(full.get("oi") or 0),
+        },
+    }
+    await broadcast({"type": "live_feed", "feeds": {key: feed}, "currentTs": str(ts_ms)})
 
-def _pe(d):
-    o = {}; i = 0
-    dm = {1:"atp",2:"cp",6:"uc",7:"lc",8:"high52",9:"low52",10:"ltp",11:"high",12:"low"}
-    while i < len(d):
-        t = d[i]; i += 1; fn = t>>3; wt = t&7
-        if wt == 1 and i+8 <= len(d):
-            v = _struct.unpack_from('<d',d,i)[0]; i += 8
-            if fn in dm: o[dm[fn]] = round(v,2)
-        elif wt == 0: _, i = _rv(d,i)
-        elif wt == 2: ln,i = _rv(d,i); i += ln
-        elif wt == 5 and i+4 <= len(d): i += 4
-        else: break
-    return o
 
-def _pl(d):
-    o = {}; i = 0
-    while i < len(d):
-        t = d[i]; i += 1; fn = t>>3; wt = t&7
-        if wt == 1 and i+8 <= len(d):
-            v = _struct.unpack_from('<d',d,i)[0]; i += 8
-            if fn == 1: o["ltp"] = round(v,2)
-            elif fn == 4: o["cp"] = round(v,2)
-        elif wt == 0: _, i = _rv(d,i)
-        elif wt == 2: ln,i = _rv(d,i); i += ln
-        elif wt == 5 and i+4 <= len(d): i += 4
-        else: break
-    return o
+async def _on_zerodha_status(status: str):
+    print(f"[Feed] Zerodha ticker status: {status}")
 
-def _pmf(d):
-    o = {}; i = 0
-    while i < len(d):
-        t = d[i]; i += 1; fn = t>>3; wt = t&7
-        if wt == 2:
-            ln,i = _rv(d,i); ch = d[i:i+ln]; i += ln
-            if fn == 1:
-                lt = _pl(ch)
-                if lt and lt.get("ltp") and "ltpc" not in o: o["ltpc"] = lt
-            elif fn == 2:
-                inn = _pmf(ch)
-                for k,v in inn.items():
-                    if k not in o: o[k] = v
-                    elif k == "ltpc" and isinstance(v,dict):
-                        [o["ltpc"].setdefault(fk,fv) for fk,fv in v.items()]
-            elif fn == 4:
-                ef = _pe(ch)
-                if ef:
-                    o["efeed"] = ef
-                    if "ltpc" not in o: o["ltpc"] = {}
-                    lv = ef.get("ltp"); cv = ef.get("cp")
-                    if lv and lv != 0: o["ltpc"]["ltp"] = lv
-                    if cv and cv != 0 and "cp" not in o["ltpc"]: o["ltpc"]["cp"] = cv
-        elif wt == 1 and i+8 <= len(d): i += 8
-        elif wt == 0: _, i = _rv(d,i)
-        elif wt == 5 and i+4 <= len(d): i += 4
-        else: break
-    return o
-
-def _pfd(d):
-    o = {}; i = 0
-    while i < len(d):
-        t = d[i]; i += 1; fn = t>>3; wt = t&7
-        if wt == 2:
-            ln,i = _rv(d,i); ch = d[i:i+ln]; i += ln
-            if fn == 1: o["ltpc"] = _pl(ch)
-            elif fn == 2: o.update(_pmf(ch))
-        elif wt == 0: _, i = _rv(d,i)
-        elif wt == 1 and i+8 <= len(d): i += 8
-        elif wt == 5 and i+4 <= len(d): i += 4
-        else: break
-    return o
-
-def _pme(d):
-    k = ""; v = {}; i = 0
-    while i < len(d):
-        t = d[i]; i += 1; fn = t>>3; wt = t&7
-        if wt == 2:
-            ln,i = _rv(d,i); ch = d[i:i+ln]; i += ln
-            if fn == 1: k = ch.decode("utf-8","replace")
-            elif fn == 2: v = _pfd(ch)
-        elif wt == 0: _, i = _rv(d,i)
-        elif wt == 1 and i+8 <= len(d): i += 8
-        elif wt == 5 and i+4 <= len(d): i += 4
-        else: break
-    return k,v
-
-def _pmi(d):
-    seg = {}; i = 0
-    ST = {0:"CLOSED",1:"NORMAL_OPEN",2:"NORMAL_OPEN",3:"PREOPEN",4:"CLOSED"}
-    while i < len(d):
-        t = d[i]; i += 1; fn = t>>3; wt = t&7
-        if wt == 2:
-            ln,i = _rv(d,i); ch = d[i:i+ln]; i += ln
-            if fn == 1:
-                si=0; sn=""; sv=0
-                while si < len(ch):
-                    st = ch[si]; si += 1; sf = st>>3; sw = st&7
-                    if sw == 2:
-                        sln,si = _rv(ch,si)
-                        if sf == 1: sn = ch[si:si+sln].decode("utf-8","replace")
-                        si += sln
-                    elif sw == 0: sv,si = _rv(ch,si)
-                    else: break
-                if sn: seg[sn] = ST.get(sv,"NORMAL_OPEN")
-        elif wt == 0: _, i = _rv(d,i)
-        elif wt == 1 and i+8 <= len(d): i += 8
-        elif wt == 5 and i+4 <= len(d): i += 4
-        else: break
-    return seg
-
-try:
-    from upstox_client.feeder.proto import MarketDataFeedV3_pb2 as _pb
-    _HAS_PB = True
-except ImportError:
-    _HAS_PB = False
-
-_TYPE_MAP = {0: "initial_feed", 1: "live_feed", 2: "market_info"}
-_STATUS_MAP = {0:"PREOPEN",1:"PREOPEN",2:"NORMAL_OPEN",3:"CLOSED",4:"CLOSING",5:"CLOSED"}
-
-def _ohlc_list_to_efeed(ohlc_list):
-    """Extract day OHLC from MarketOHLC repeated field."""
-    ef = {}
-    for o in ohlc_list:
-        if o.interval in ("1d", "I1"):
-            ef["open"]  = round(o.open, 2) if o.open else 0
-            ef["high"]  = round(o.high, 2) if o.high else 0
-            ef["low"]   = round(o.low, 2) if o.low else 0
-            ef["ltp"]   = round(o.close, 2) if o.close else 0
-            ef["cp"]    = 0  # not in OHLC, comes from ltpc
-            break
-    return ef
-
-def _feed_to_dict(feed):
-    """Convert protobuf Feed message to dict compatible with frontend."""
-    r = {}
-    which = feed.WhichOneof("FeedUnion")
-    if which == "ltpc":
-        lt = feed.ltpc
-        r["ltpc"] = {"ltp": round(lt.ltp, 2), "cp": round(lt.cp, 2)}
-    elif which == "fullFeed":
-        ff = feed.fullFeed
-        ff_which = ff.WhichOneof("FullFeedUnion")
-        if ff_which == "marketFF":
-            mf = ff.marketFF
-            r["ltpc"] = {"ltp": round(mf.ltpc.ltp, 2), "cp": round(mf.ltpc.cp, 2)}
-            if mf.marketOHLC and mf.marketOHLC.ohlc:
-                ef = _ohlc_list_to_efeed(mf.marketOHLC.ohlc)
-                ef["ltp"] = round(mf.ltpc.ltp, 2)
-                ef["cp"]  = round(mf.ltpc.cp, 2)
-                ef["atp"] = round(mf.atp, 2) if mf.atp else 0
-                r["efeed"] = ef
-            if mf.optionGreeks and mf.optionGreeks.delta:
-                r["greeks"] = {
-                    "delta": round(mf.optionGreeks.delta, 4),
-                    "theta": round(mf.optionGreeks.theta, 4),
-                    "gamma": round(mf.optionGreeks.gamma, 6),
-                    "vega": round(mf.optionGreeks.vega, 4),
-                }
-            if mf.iv: r.setdefault("efeed",{})["iv"] = round(mf.iv, 2)
-            if mf.oi: r.setdefault("efeed",{})["oi"] = mf.oi
-        elif ff_which == "indexFF":
-            iff = ff.indexFF
-            r["ltpc"] = {"ltp": round(iff.ltpc.ltp, 2), "cp": round(iff.ltpc.cp, 2)}
-            if iff.marketOHLC and iff.marketOHLC.ohlc:
-                ef = _ohlc_list_to_efeed(iff.marketOHLC.ohlc)
-                ef["ltp"] = round(iff.ltpc.ltp, 2)
-                ef["cp"]  = round(iff.ltpc.cp, 2)
-                r["efeed"] = ef
-    elif which == "firstLevelWithGreeks":
-        fl = feed.firstLevelWithGreeks
-        r["ltpc"] = {"ltp": round(fl.ltpc.ltp, 2), "cp": round(fl.ltpc.cp, 2)}
-    return r
-
-def decode_v3(raw):
-    try: return json.loads(raw.decode("utf-8"))
-    except: pass
-    if _HAS_PB:
-        try:
-            resp = _pb.FeedResponse()
-            resp.ParseFromString(raw)
-            r = {"type": _TYPE_MAP.get(resp.type, "live_feed"),
-                 "feeds": {}, "currentTs": str(resp.currentTs or int(time.time()*1000))}
-            for key, feed in resp.feeds.items():
-                fd = _feed_to_dict(feed)
-                if fd: r["feeds"][key] = fd
-            if resp.marketInfo and resp.marketInfo.segmentStatus:
-                seg = {}
-                for name, status in resp.marketInfo.segmentStatus.items():
-                    seg[name] = _STATUS_MAP.get(status, "NORMAL_OPEN")
-                r["marketInfo"] = {"segmentStatus": seg}
-                r["type"] = "market_info"
-            return r if (r["feeds"] or r.get("marketInfo")) else None
-        except Exception as e:
-            print(f"[Decode-pb] {e}")
-    # Fallback to custom decoder
-    try:
-        r = {"type":"unknown","feeds":{},"currentTs":str(int(time.time()*1000))}
-        i = 0; mt = 0
-        while i < len(raw):
-            t = raw[i]; i += 1; fn = t>>3; wt = t&7
-            if wt == 0:
-                v,i = _rv(raw,i)
-                if fn == 1: mt = v
-                elif fn == 3: r["currentTs"] = str(v)
-            elif wt == 2:
-                ln,i = _rv(raw,i); ch = raw[i:i+ln]; i += ln
-                if fn == 2:
-                    k,v = _pme(ch)
-                    if k and v: r["feeds"][k] = v
-                elif fn == 4: r["marketInfo"] = {"segmentStatus": _pmi(ch)}
-            elif wt == 1 and i+8 <= len(raw): i += 8
-            elif wt == 5 and i+4 <= len(raw): i += 4
-            else: break
-        if mt == 2 or r.get("marketInfo"): r["type"] = "market_info"
-        elif mt == 1 or r["feeds"]: r["type"] = "live_feed"
-        return r if (r["feeds"] or r.get("marketInfo")) else None
-    except: return None
 
 def _ex(fv):
     ltpc=fv.get("ltpc",{}); ef=fv.get("efeed",{})
@@ -339,9 +151,10 @@ class AppState:
     expiry_cache:  dict = {}
     prev_close:    dict = {}
     connected_clients: Set[WebSocket] = set()
-    upstox_ws  = None
+    feed_client = None   # the shared Zerodha ticker2 once started (was: raw Upstox websocket)
     feed_task  = None
     chain_task = None
+    _index_poll_task = None
     frame_count: int = 0
     decode_ok:   int = 0
     subscribed_option_keys: set = set()
@@ -516,8 +329,8 @@ async def startup_init():
         [mcx_key(s,1) for s in ["CRUDEOIL","NATURALGAS", "COPPER"]]
     ))
 
-    # Step 3: Refresh NSE_EQ keys from instrument master (fixes stale ISINs)
-    refresh_nse_eq_keys()
+    # Step 3: Resolve NSE_EQ keys from the Zerodha instrument dump
+    await refresh_nse_eq_keys()
 
     # Step 4: Build reverse map — only PRIMARY (current month) MCX key per symbol
     FEED_KEY_TO_SYM.clear()
@@ -666,9 +479,9 @@ async def startup_init():
         })
 
     # Step 8: Re-subscribe Upstox feed to validated commodity keys
-    if state.upstox_ws and COMMODITY_KEYS:
+    if state.feed_client and COMMODITY_KEYS:
         try:
-            await _sub_binary(state.upstox_ws, COMMODITY_KEYS, "full")
+            await _sub_binary(state.feed_client, COMMODITY_KEYS, "full")
             print(f"[Init] Re-subscribed MCX keys: {COMMODITY_KEYS}")
         except Exception as e:
             print(f"[Init] MCX re-sub error: {e}")
@@ -683,7 +496,7 @@ async def startup_init():
     # get_option_keys() returns [] there. After chains load here we must
     # explicitly push the keys to the live feed — otherwise CE/PE LTP
     # won't update until the first ATM shift or the 60-second periodic refresh.
-    if state.upstox_ws:
+    if state.feed_client:
         await _subscribe_new_option_keys()
         print(f"[Init] Option keys subscribed to WS: {len(loc_engine.get_option_keys())} keys")
 
@@ -780,7 +593,7 @@ async def _refresh_calc_option_ohlc(symbol: str):
 
 
 async def _subscribe_new_option_keys():
-    if not state.upstox_ws: return
+    if not state.feed_client: return
     loc_keys  = [k for k in loc_engine.get_option_keys() if k]
     itm1_keys = [k for k in loc_engine.get_itm1_option_keys() if k]
     calc_keys = [k for k in loc_engine.get_calc_option_keys() if k]
@@ -797,14 +610,14 @@ async def _subscribe_new_option_keys():
     stale_keys = [k for k in state.subscribed_option_keys if k not in all_keys_set]
     if stale_keys:
         try:
-            await _unsub_binary(state.upstox_ws, stale_keys)
+            await _unsub_binary(state.feed_client, stale_keys)
         except Exception as e:
             print(f"[Options] Unsubscribe error: {e}")
         state.subscribed_option_keys.difference_update(stale_keys)
         for key in stale_keys:
             option_key_last_tick.pop(key, None)
     if new_keys:
-        await _sub_binary(state.upstox_ws, new_keys, "full")
+        await _sub_binary(state.feed_client, new_keys, "full")
         state.subscribed_option_keys.update(new_keys)
         # Seed tick timestamps so stale monitor gives a 30s grace period before
         # REST fallback fires (prevents mass REST calls at startup for all symbols)
@@ -1322,10 +1135,10 @@ async def _daily_rollover_check():
 
     await _refresh_chains_for_rolled(chain_refresh, parallel=False)
 
-    if state.upstox_ws:
+    if state.feed_client:
         if mcx_spot_rolled and COMMODITY_KEYS:
             try:
-                await _sub_binary(state.upstox_ws, COMMODITY_KEYS, "full")
+                await _sub_binary(state.feed_client, COMMODITY_KEYS, "full")
                 print(f"[Rollover] Re-subscribed MCX keys: {COMMODITY_KEYS}")
             except Exception as e:
                 print(f"[Rollover] MCX re-sub: {e}")
@@ -1361,7 +1174,7 @@ async def _daily_rollover_check():
             return
         chain_refresh_b = {sym: new_def for sym, _o, new_def in stock_rolled}
         await _refresh_chains_for_rolled(chain_refresh_b, parallel=True)
-        if state.upstox_ws:
+        if state.feed_client:
             try:
                 await _subscribe_new_option_keys()
             except Exception as e:
@@ -1425,56 +1238,34 @@ async def periodic_refresh():
 
 
 # ══════════════════════════════════════════════════════════════════
-#  WS SUBSCRIPTION — TEXT FRAME (not bytes!)
+#  WS SUBSCRIPTION — thin wrappers over the shared Zerodha ticker2
+#  `ws` param kept for call-site compatibility (every caller — startup_init,
+#  calculator.py, rollover paths — still passes state.feed_client through
+#  unchanged); the actual connection is the module-level `ticker2` singleton.
 # ══════════════════════════════════════════════════════════════════
 async def _sub_binary(ws, keys: list, mode: str = "full"):
-    """Send subscription as BINARY frame — Upstox v3 requires binary opcode."""
-    msg = json.dumps({
-        "guid": f"raima_{int(time.time()*1000)}",
-        "method": "sub",
-        "data": {"mode": mode, "instrumentKeys": keys},
-    }).encode("utf-8")
-    print(f"[Feed] Subscribing {len(keys)} keys, mode={mode}")
-    await ws.send(msg)   # BINARY frame (bytes)
+    tokens = [t for t in (key_to_token(k) for k in keys) if t]
+    if not tokens:
+        return
+    print(f"[Feed] Subscribing {len(tokens)} tokens, mode={mode}")
+    ticker2.subscribe(tokens, mode)
 
 async def _unsub_binary(ws, keys: list):
-    """Send unsubscribe as BINARY frame — mirrors _sub_binary. Without this,
-    every ATM/ITM-2 strike roll and every expiry rollover only ever ADDS keys
-    to the live Upstox subscription and never removes the superseded ones —
-    the set grows unbounded for the life of the process. Two consequences:
-    stale keys keep consuming a slot against Upstox's per-connection
-    subscription cap, and once that cap is hit, brand-new strikes (which are
-    exactly what a strike roll or expiry rollover needs fresh ticks for)
-    silently fail to subscribe — the frontend then shows a CE/PE LTP that
-    never updates, indistinguishable from a live illiquid contract."""
+    """Mirrors _sub_binary. Without this, every ATM/ITM-2 strike roll and
+    every expiry rollover only ever ADDS keys to the live subscription and
+    never removes the superseded ones — the set grows unbounded for the
+    life of the process. Two consequences: stale keys keep consuming a slot
+    against Zerodha's per-connection subscription cap, and once that cap is
+    hit, brand-new strikes (which are exactly what a strike roll or expiry
+    rollover needs fresh ticks for) silently fail to subscribe — the
+    frontend then shows a CE/PE LTP that never updates, indistinguishable
+    from a live illiquid contract."""
     if not keys: return
-    msg = json.dumps({
-        "guid": f"raima_{int(time.time()*1000)}",
-        "method": "unsub",
-        "data": {"instrumentKeys": keys},
-    }).encode("utf-8")
-    print(f"[Feed] Unsubscribing {len(keys)} superseded keys")
-    await ws.send(msg)   # BINARY frame (bytes)
-
-# How long the Upstox WS can be silent before we force-reconnect.
-# Upstox sends ticks every ~1 s during market hours; 120 s of silence
-# means the TCP connection is half-open (NAT/LB timeout).
-_FEED_SILENCE_TIMEOUT = 120  # seconds
-
-def _ws_connect(url, headers):
-    import ssl as _ssl
-    sig = inspect.signature(websockets.connect); p = sig.parameters
-    ctx = _ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = _ssl.CERT_NONE
-    # ping_interval=20 makes websockets send a WS-level ping every 20 s and
-    # close the connection if no pong arrives within ping_timeout=10 s.
-    # This is the primary fix for the half-open TCP freeze after 1-2 days.
-    kw  = dict(ping_interval=20, ping_timeout=10, max_size=2**24, ssl=ctx)
-    if headers:
-        if "extra_headers" in p: kw["extra_headers"] = headers
-        else:                    kw["additional_headers"] = headers
-    return websockets.connect(url, **kw)
+    tokens = [t for t in (key_to_token(k) for k in keys) if t]
+    if not tokens:
+        return
+    print(f"[Feed] Unsubscribing {len(tokens)} superseded tokens")
+    ticker2.unsubscribe(tokens)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1686,147 +1477,102 @@ async def _flush_feed_buffer():
 
 
 # ══════════════════════════════════════════════════════════════════
-#  UPSTOX LIVE FEED
+#  ZERODHA LIVE FEED
+#  Reconnect/watchdog is handled internally by the shared ticker2 (see
+#  backend/history2/ticker.py) — this function's job is just the one-time
+#  subscribe sequence, then it idles forever so _supervise() doesn't treat
+#  a normal return as a crash needing a restart-with-full-resubscribe.
 # ══════════════════════════════════════════════════════════════════
-async def _get_authorized_ws_url(token: str) -> str:
-    """Get authorized WebSocket URL from Upstox v3 authorize endpoint."""
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get("https://api.upstox.com/v3/feed/market-data-feed/authorize",
-                        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
-        if r.status_code == 200:
-            data = (r.json() or {}).get("data", {})
-            url = data.get("authorizedRedirectUri") or data.get("authorized_redirect_uri")
-            if url:
-                print(f"[Feed] Authorized WS URL obtained")
-                return url
-        print(f"[Feed] Authorize failed: {r.status_code} {r.text[:200]}")
-    return FEED_URL  # fallback
+_INDEX_POLL_INTERVAL = 7  # seconds
+
+async def _index_ohlc_poll():
+    """Zerodha's ticker only streams LTP for index tokens (no OHLC/depth
+    mode for indices, unlike Upstox which streamed full index OHLC over the
+    WS feed) — poll kite.quote() for the handful of index keys periodically
+    so spot_high/spot_low stay populated for the LOC formulas that use them.
+    Routed through broadcast() so state.market_data / _route_tick get the
+    same update a WS tick would have produced."""
+    while True:
+        await asyncio.sleep(_INDEX_POLL_INTERVAL)
+        if not state.access_token or not INDEX_KEYS:
+            continue
+        try:
+            data = await fetch_index_quotes(INDEX_KEYS, state.access_token)
+        except Exception as e:
+            print(f"[IndexPoll] error: {e}")
+            continue
+        if data:
+            await broadcast({"type": "live_feed", "feeds": data,
+                              "currentTs": str(int(time.time() * 1000))})
 
 async def start_feed():
     if USE_MOCK:
         from backend.mock_feed import start_mock_feed
         await start_mock_feed(broadcast); return
 
-    headers = {"Authorization": f"Bearer {state.access_token}"}
+    while not state.access_token:
+        print("[Feed] No Zerodha access token yet — waiting for login")
+        await asyncio.sleep(2)
+
+    # Fresh (re)start: clear bookkeeping so a stale key from before a
+    # restart doesn't look "already subscribed" — mirrors the old
+    # per-reconnect clear, now done once here since ticker2 itself handles
+    # reconnects transparently (subscribed_tokens survives those).
+    state.subscribed_option_keys.clear()
+
+    try:
+        ticker2.start(_on_zerodha_tick, _on_zerodha_status)
+    except Exception as e:
+        print(f"[Feed] ticker2.start() failed: {e}")
+        return
+    state.feed_client = ticker2
+    print("[Feed] Zerodha ticker connected/shared")
+
+    # 1. Indices — LTP mode only (see _index_ohlc_poll for why)
+    await _sub_binary(ticker2, INDEX_KEYS, "ltp")
+    await asyncio.sleep(0.2)
+
+    # 2. Commodities — full mode (both current & next month)
+    await _sub_binary(ticker2, COMMODITY_KEYS, "full")
+    await asyncio.sleep(0.2)
+
+    # 3. F&O stocks — full mode for OHLC
+    stock_keys = list(dict.fromkeys(_ik.FO_STOCK_KEYS))
+    for i in range(0, len(stock_keys), 100):
+        await _sub_binary(ticker2, stock_keys[i:i+100], "full")
+        await asyncio.sleep(0.2)
+
+    # 4. Option CE/PE keys from chain (ITM-2, plus additive ITM-1)
+    opt_keys  = loc_engine.get_option_keys()
+    itm1_keys = loc_engine.get_itm1_option_keys()
+    all_opt_keys = list(dict.fromkeys(opt_keys + itm1_keys))
+    if all_opt_keys:
+        await _sub_binary(ticker2, all_opt_keys, "full")
+        state.subscribed_option_keys.update(all_opt_keys)
+        _now = time.time()
+        for _k in all_opt_keys:
+            option_key_last_tick[_k] = _now
+        for st_sym in loc_engine.symbols.values():
+            if st_sym.ce.instrument_key:
+                option_key_map[st_sym.ce.instrument_key] = (st_sym.symbol,"CE")
+            if st_sym.pe.instrument_key:
+                option_key_map[st_sym.pe.instrument_key] = (st_sym.symbol,"PE")
+            if st_sym.itm1_ce.instrument_key:
+                itm1_option_key_map[st_sym.itm1_ce.instrument_key] = (st_sym.symbol,"CE")
+            if st_sym.itm1_pe.instrument_key:
+                itm1_option_key_map[st_sym.itm1_pe.instrument_key] = (st_sym.symbol,"PE")
+
+    print(f"[Feed] Subscribed: {len(INDEX_KEYS)} idx | "
+          f"{len(COMMODITY_KEYS)} mcx | {len(stock_keys)} stocks | "
+          f"{len(all_opt_keys)} options ({len(opt_keys)} ITM2 + {len(itm1_keys)} ITM1)")
+
+    if not state._index_poll_task or state._index_poll_task.done():
+        state._index_poll_task = asyncio.create_task(_index_ohlc_poll())
+
+    # ticker2 owns reconnect/watchdog from here — idle forever so a normal
+    # return here isn't mistaken by _supervise() for a crash.
     while True:
-        try:
-            async with _ws_connect(FEED_URL, headers) as ws:
-                state.upstox_ws = ws
-                print("[Feed] Connected to Upstox V3 WebSocket")
-                # Fresh connection = fresh subscription state on Upstox's side.
-                # Clear the bookkeeping set so it doesn't carry phantom entries
-                # from the previous connection forward — otherwise a stale key
-                # from before the reconnect looks "already subscribed" to
-                # _subscribe_new_option_keys() even though nothing was ever
-                # sent for it on this connection, and a genuinely new key that
-                # happens to reuse an old (now-stale) bookkeeping entry would
-                # silently never get subscribed at all.
-                state.subscribed_option_keys.clear()
-
-                # 1. Indices — full mode
-                await _sub_binary(ws, INDEX_KEYS, "full")
-                await asyncio.sleep(0.5)
-
-                # 2. Commodities — full mode (both current & next month)
-                await _sub_binary(ws, COMMODITY_KEYS, "full")
-                await asyncio.sleep(0.5)
-
-                # 3. F&O stocks (ISIN keys) — full mode for OHLC
-                stock_keys = list(dict.fromkeys(_ik.FO_STOCK_KEYS))
-                for i in range(0, len(stock_keys), 100):
-                    await _sub_binary(ws, stock_keys[i:i+100], "full")
-                    await asyncio.sleep(0.3)
-
-                # 4. Option CE/PE keys from chain (ITM-2, plus additive ITM-1)
-                opt_keys  = loc_engine.get_option_keys()
-                itm1_keys = loc_engine.get_itm1_option_keys()
-                all_opt_keys = list(dict.fromkeys(opt_keys + itm1_keys))
-                if all_opt_keys:
-                    await _sub_binary(ws, all_opt_keys, "full")
-                    state.subscribed_option_keys.update(all_opt_keys)
-                    # Seed tick timestamps so stale monitor gives 30s grace
-                    _now = time.time()
-                    for _k in all_opt_keys:
-                        option_key_last_tick[_k] = _now
-                    for st_sym in loc_engine.symbols.values():
-                        if st_sym.ce.instrument_key:
-                            option_key_map[st_sym.ce.instrument_key] = (st_sym.symbol,"CE")
-                        if st_sym.pe.instrument_key:
-                            option_key_map[st_sym.pe.instrument_key] = (st_sym.symbol,"PE")
-                        if st_sym.itm1_ce.instrument_key:
-                            itm1_option_key_map[st_sym.itm1_ce.instrument_key] = (st_sym.symbol,"CE")
-                        if st_sym.itm1_pe.instrument_key:
-                            itm1_option_key_map[st_sym.itm1_pe.instrument_key] = (st_sym.symbol,"PE")
-
-                print(f"[Feed] Subscribed: {len(INDEX_KEYS)} idx | "
-                      f"{len(COMMODITY_KEYS)} mcx | {len(stock_keys)} stocks | "
-                      f"{len(all_opt_keys)} options ({len(opt_keys)} ITM2 + {len(itm1_keys)} ITM1)")
-
-                tick_n = 0
-                last_frame_ts = time.time()
-                print(f"[Feed] Waiting for data...")
-
-                async def _read_frames():
-                    nonlocal tick_n, last_frame_ts
-                    async for raw in ws:
-                        last_frame_ts = time.time()
-                        state.frame_count += 1
-                        rtype = "binary" if isinstance(raw, bytes) else "text"
-                        rlen = len(raw) if raw else 0
-                        try:
-                            msg = (decode_v3(raw) if isinstance(raw, bytes)
-                                   else (json.loads(raw) if raw else None))
-                            if msg and (msg.get("feeds") or msg.get("marketInfo")):
-                                state.decode_ok += 1
-                                nf = len(msg.get("feeds", {}))
-                                mt = msg.get("type", "?")
-                                if state.frame_count <= 10 or state.frame_count % 100 == 0:
-                                    print(f"[Feed] Frame #{state.frame_count}: {rtype} {rlen}B → type={mt} feeds={nf}")
-                                await broadcast(msg)
-                                tick_n += 1
-                                if tick_n % 300 == 0:
-                                    await _subscribe_new_option_keys()
-                            else:
-                                print(f"[Feed] Frame #{state.frame_count}: {rtype} {rlen}B → decode returned None")
-                        except Exception as ex:
-                            print(f"[Decode] Frame #{state.frame_count}: {rtype} {rlen}B → error: {ex}")
-
-                async def _silence_watchdog():
-                    """Force-close the WS if no frame arrives for _FEED_SILENCE_TIMEOUT s.
-                    Catches half-open TCP connections where ping_interval alone may not
-                    fire (e.g. Upstox sends a pong but no data ticks during pre-open)."""
-                    while True:
-                        await asyncio.sleep(30)
-                        age = time.time() - last_frame_ts
-                        if age > _FEED_SILENCE_TIMEOUT:
-                            print(f"[Feed] Silence watchdog: no frame for {age:.0f}s — forcing reconnect")
-                            await ws.close()
-                            return
-
-                read_task = asyncio.ensure_future(_read_frames())
-                wdog_task = asyncio.ensure_future(_silence_watchdog())
-                try:
-                    done, pending = await asyncio.wait(
-                        {read_task, wdog_task}, return_when=asyncio.FIRST_COMPLETED)
-                    for t in pending:
-                        t.cancel()
-                    # Re-raise any exception from the reader
-                    for t in done:
-                        if not t.cancelled() and t.exception():
-                            raise t.exception()
-                finally:
-                    read_task.cancel()
-                    wdog_task.cancel()
-                print("[Feed] WebSocket loop ended (server closed connection)")
-
-        except asyncio.CancelledError: break
-        except Exception as e:
-            import traceback
-            print(f"[Feed] Error: {e}")
-            traceback.print_exc()
-        finally: state.upstox_ws = None
-        print("[Feed] Reconnecting in 5s...")
-        await asyncio.sleep(5)
+        await asyncio.sleep(3600)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1841,29 +1587,52 @@ async def login(payload: dict):
     raise HTTPException(401,"Invalid password")
 
 @app.get("/auth/upstox/login")
-async def upstox_login():
-    if not API_KEY: raise HTTPException(400,"API_KEY not set")
-    params = {"client_id":API_KEY,"redirect_uri":REDIRECT_URI,"response_type":"code"}
-    return RedirectResponse(f"https://api.upstox.com/v2/login/authorization/dialog?{urlencode(params)}")
+async def zerodha_login_redirect():
+    # Route path kept as-is (see migration plan) — now drives Zerodha's
+    # login dialog instead of Upstox's. Zerodha's redirect_uri is fixed in
+    # the Kite Connect app console, not passed here; it must point at
+    # whichever of /auth/callback or /api/zerodha/callback (History 2's own,
+    # already-registered route) you've configured there — both handlers do
+    # the same request_token exchange, so either works.
+    try:
+        return RedirectResponse(zc.login_url())
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
 
 @app.get("/auth/callback")
-async def auth_cb(code: str):
-    async with httpx.AsyncClient() as c:
-        r = await c.post("https://api.upstox.com/v2/login/authorization/token",
-            data={"code":code,"client_id":API_KEY,"client_secret":API_SECRET,
-                  "redirect_uri":REDIRECT_URI,"grant_type":"authorization_code"},
-            headers={"Accept":"application/json"})
-    d = r.json()
-    if "access_token" not in d: raise HTTPException(400,str(d))
-    state.access_token = d["access_token"]
-    loc_engine.access_token = d["access_token"]
-    asyncio.create_task(_restart()); return RedirectResponse("/?auth=success")
+async def auth_cb(request_token: str = "", status: str = ""):
+    if status and status != "success":
+        raise HTTPException(400, f"Zerodha authentication failed (status={status})")
+    if not request_token:
+        raise HTTPException(400, "request_token required")
+    try:
+        await zc.generate_session(request_token)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    state.access_token = state2.access_token
+    loc_engine.access_token = state.access_token
+    asyncio.create_task(_restart())
+    return RedirectResponse("/?auth=success")
 
 @app.post("/auth/token")
 async def set_token(payload: dict):
-    t = payload.get("access_token","")
-    if not t: raise HTTPException(400,"access_token required")
-    state.access_token = t; loc_engine.access_token = t
+    """Accepts either {"request_token": "..."} (drives the normal Zerodha
+    exchange, same as /auth/callback) or {"access_token": "..."} (direct
+    passthrough — advanced/scripted-login escape hatch, see
+    zerodha_client.set_access_token)."""
+    request_token = payload.get("request_token", "")
+    access_token = payload.get("access_token", "")
+    if request_token:
+        try:
+            await zc.generate_session(request_token)
+        except Exception as e:
+            raise HTTPException(400, str(e))
+    elif access_token:
+        zc.set_access_token(access_token)
+    else:
+        raise HTTPException(400, "request_token or access_token required")
+    state.access_token = state2.access_token
+    loc_engine.access_token = state.access_token
     asyncio.create_task(_restart())
     return {"status":"ok","message":"Feed restarting..."}
 
@@ -1895,7 +1664,7 @@ async def ping():
 async def api_status():
     return {
         "auth": bool(state.access_token) or USE_MOCK,
-        "feed_connected": state.upstox_ws is not None,
+        "feed_connected": state.feed_client is not None,
         "instruments": len(state.market_data), "frames": state.frame_count,
         "decoded": state.decode_ok, "mode": "mock" if USE_MOCK else "live",
         "option_keys": len(state.subscribed_option_keys),
@@ -1972,7 +1741,7 @@ async def get_calculator(symbol: str, expiry: str = ""):
     if not expiry:
         raise HTTPException(400, "expiry query param required")
     if not state.access_token:
-        raise HTTPException(503, "no Upstox access token")
+        raise HTTPException(503, "no Zerodha access token")
 
     info = state.expiry_cache.get(sym, {})
     valid_expiries = info.get("all") or []
@@ -1997,7 +1766,7 @@ async def get_calculator(symbol: str, expiry: str = ""):
         market_data=state.market_data,
         prev_close=state.prev_close,
         access_token=state.access_token,
-        upstox_ws=state.upstox_ws,
+        feed_client=state.feed_client,
         sub_binary=_sub_binary,
         subscribed_set=state.subscribed_calc_spot_keys,
     )
@@ -2012,7 +1781,7 @@ async def get_ohlc(key: str):
 
 @app.get("/api/ohlc-live/{key:path}")
 async def get_ohlc_live(key: str, tf: str = "minutes/1"):
-    """Fetch intraday candles from Upstox API v3."""
+    """Fetch intraday candles from Zerodha."""
     if not state.access_token: return {"key":key,"candles":[]}
     # Parse tf like "minutes/1", "hours/1", "days/1"
     parts = tf.split("/")
@@ -2051,15 +1820,11 @@ async def get_ohlc_hist(key: str, unit: str = "minutes", interval: int = 1,
         if len(remaining) >= 4: from_date = remaining[3]
 
     if not state.access_token: return {"key":key,"candles":[]}
-    from .instruments import fetch_intraday_candles
-    import httpx
-    from datetime import date
+    from datetime import date, timedelta
 
     if not to_date:
         to_date = date.today().isoformat()
     if not from_date:
-        # default: 5 days back
-        from datetime import timedelta
         from_date = (date.today()-timedelta(days=5)).isoformat()
 
     # For today's intraday, use intraday endpoint
@@ -2068,39 +1833,16 @@ async def get_ohlc_hist(key: str, unit: str = "minutes", interval: int = 1,
         candles = await fetch_intraday_candles(key, state.access_token, unit, interval)
         return {"key":key,"candles":candles}
 
-    # Historical endpoint
+    # Historical endpoint (Zerodha kite.historical_data(), see instruments.py)
     try:
-        encoded = key.replace("|", "%7C")
-        url = f"https://api.upstox.com/v3/historical-candle/{encoded}/{unit}/{interval}/{to_date}/{from_date}"
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get(url, headers={"Authorization":f"Bearer {state.access_token}","Accept":"application/json"})
-            if r.status_code == 200:
-                raw_candles = (r.json() or {}).get("data",{})
-                if raw_candles is None: return {"key":key,"candles":[]}
-                candles_raw = (raw_candles or {}).get("candles",[]) or []
-                from datetime import datetime
-                result = []
-                for candle in candles_raw:
-                    if len(candle) < 5: continue
-                    try:
-                        ts = int(datetime.fromisoformat(str(candle[0])).timestamp()*1000)
-                    except:
-                        ts = 0
-                    if ts:
-                        result.append({
-                            "t":ts,"o":float(candle[1] or 0),"h":float(candle[2] or 0),
-                            "l":float(candle[3] or 0),"c":float(candle[4] or 0),
-                            "v":int(candle[5]) if len(candle)>5 else 0,
-                        })
-                # Also merge with intraday for today
-                if to_date == today:
-                    today_candles = await fetch_intraday_candles(key, state.access_token, unit, interval)
-                    existing_times = {c["t"] for c in result}
-                    result += [c for c in today_candles if c["t"] not in existing_times]
-                result.sort(key=lambda c: c["t"])
-                return {"key":key,"candles":result}
-            else:
-                print(f"[Hist] {key} HTTP {r.status_code}: {r.text[:100]}")
+        result = await fetch_historical_candles(key, state.access_token, unit, interval, from_date, to_date)
+        # Merge with intraday for today so a range ending today includes it
+        if to_date == today:
+            today_candles = await fetch_intraday_candles(key, state.access_token, unit, interval)
+            existing_times = {c["t"] for c in result}
+            result += [c for c in today_candles if c["t"] not in existing_times]
+        result.sort(key=lambda c: c["t"])
+        return {"key":key,"candles":result}
     except Exception as e:
         print(f"[Hist] {key}: {e}")
     # Fallback to intraday
@@ -2143,7 +1885,7 @@ async def debug_mcx():
 @app.post("/api/subscribe")
 async def subscribe(payload: dict):
     keys=payload.get("instrumentKeys",[]); mode=payload.get("mode","full")
-    if state.upstox_ws and keys: await _sub_binary(state.upstox_ws, keys, mode)
+    if state.feed_client and keys: await _sub_binary(state.feed_client, keys, mode)
     return {"status":"ok"}
 
 _watchlists: dict = {}
@@ -2198,7 +1940,7 @@ async def spa(path: str):
 # ══════════════════════════════════════════════════════════════════
 @app.on_event("startup")
 async def on_startup():
-    print(f"RAIMA Markets v9 | {'MOCK' if USE_MOCK else 'LIVE'} | ws={websockets.__version__}")
+    print(f"RAIMA Markets v9 | {'MOCK' if USE_MOCK else 'LIVE'} | broker=Zerodha")
     # Build initial key maps even without token
     global SPOT_KEYS_D, FEED_KEY_TO_SYM
     SPOT_KEYS_D = get_spot_keys()
@@ -2214,7 +1956,8 @@ async def on_startup():
         loc_engine.access_token = state.access_token
         state.feed_task = asyncio.create_task(_supervise("start_feed", start_feed))
     else:
-        print("[!] No token — POST /auth/token or set UPSTOX_ACCESS_TOKEN in .env")
+        print("[!] No Zerodha token yet — GET /auth/upstox/login to authenticate, "
+              "or POST /auth/token with a request_token/access_token")
 
     # Start throttled feed flush task (supervised — never allowed to die silently)
     state._flush_task = asyncio.create_task(_supervise("flush_feed_buffer", _flush_feed_buffer))
@@ -2222,20 +1965,21 @@ async def on_startup():
     # Start stale-option monitor (Bug 1 fallback: REST fetch when WS tick absent)
     asyncio.create_task(_supervise("stale_option_monitor", _stale_option_monitor))
 
-    # History 2 (Zerodha) — autonomous background engine, independent of any
-    # frontend connection, mirroring Upstox's start_feed()/periodic_refresh()
-    # autonomy above. Waits internally for Zerodha auth before doing anything;
-    # supervised so a crash restarts it instead of silently stopping recording.
+    # History 2 — autonomous background engine, independent of any frontend
+    # connection, running alongside this file's own start_feed()/
+    # periodic_refresh() autonomy on the SAME shared Zerodha session/ticker.
+    # Waits internally for Zerodha auth before doing anything; supervised so
+    # a crash restarts it instead of silently stopping recording.
     #
-    # TEMPORARILY DISABLED (2026-07-31): its initial resolve pass makes
-    # ~200 synchronous (blocking) Zerodha SDK/instrument-scan calls with no
-    # asyncio.to_thread offload, which starves this single-threaded event
-    # loop and stalls the live Upstox feed for many minutes on every restart
-    # — observed in production (Upstox [Feed] frame count nearly flatlined
-    # for 30+ minutes post-deploy). Re-enable only after engine.py's blocking
-    # calls are moved off the event loop (see engine.py TODO).
-    # from .history2 import engine as _history2_engine
-    # asyncio.create_task(_supervise("history2_engine", _history2_engine.start))
+    # Re-enabled: this was disabled (2026-07-31) because its initial resolve
+    # pass made ~200 synchronous (blocking) Zerodha SDK/instrument-scan calls
+    # with no asyncio.to_thread offload, starving the event loop and
+    # stalling the live feed for many minutes on every restart. Fixed as
+    # part of the Upstox->Zerodha migration: history2/instruments.py's
+    # _load()/resolve_*() and engine.py's _resolve_and_register_strikes()
+    # are now async and offload every kite.* call via asyncio.to_thread.
+    from .history2 import engine as _history2_engine
+    asyncio.create_task(_supervise("history2_engine", _history2_engine.start))
 
     asyncio.create_task(_delayed_startup())
 

@@ -104,11 +104,11 @@ async def _resolve_all_and_subscribe():
     strikes per symbol and subscribe everything on the ticker."""
     spot_by_symbol: dict[str, dict] = {}
     for sym in WATCHLIST:
-        spot = instr.resolve_spot(sym)
+        spot = await instr.resolve_spot(sym)
         if not spot or not spot.get("instrumentToken"):
             log_h2_error(f"History2 engine: could not resolve spot instrument for {sym} — skipped")
             continue
-        expiries = instr.list_expiries(sym)
+        expiries = await instr.list_expiries(sym)
         if not expiries:
             log_h2_error(f"History2 engine: no expiries found for {sym} — skipped")
             continue
@@ -128,7 +128,7 @@ async def _resolve_all_and_subscribe():
         if not spot_ltp:
             log_h2_error(f"History2 engine: no spot LTP for {sym} ({tracking.spot_key}) — skipped this cycle")
             continue
-        tokens = _resolve_and_register_strikes(sym, tracking, spot_ltp)
+        tokens = await _resolve_and_register_strikes(sym, tracking, spot_ltp)
         if tokens:
             all_tokens.append(tracking.spot_token)
             all_tokens.extend(tokens)
@@ -154,7 +154,7 @@ async def _batched_ltp(keys: list[str]) -> dict:
     return out
 
 
-def _resolve_and_register_strikes(sym: str, tracking: '_SymbolTracking', spot_ltp: float) -> list[int]:
+async def _resolve_and_register_strikes(sym: str, tracking: '_SymbolTracking', spot_ltp: float) -> list[int]:
     """Compute ITM-2 CE+PE strikes from spot_ltp, resolve their Zerodha
     instrument tokens, store the strikes in state2.symbol_meta and the tokens
     in state2.symbol_context (merged, not replacing the manual-subscribe
@@ -168,8 +168,8 @@ def _resolve_and_register_strikes(sym: str, tracking: '_SymbolTracking', spot_lt
     # shared functions — this only changes what this engine calls them for.
     itm2_ce_strike, itm2_pe_strike = get_itm_strikes(spot_ltp, sym, 2)
 
-    itm2_ce = instr.resolve_option(sym, tracking.expiry, itm2_ce_strike, "CE")
-    itm2_pe = instr.resolve_option(sym, tracking.expiry, itm2_pe_strike, "PE")
+    itm2_ce = await instr.resolve_option(sym, tracking.expiry, itm2_ce_strike, "CE")
+    itm2_pe = await instr.resolve_option(sym, tracking.expiry, itm2_pe_strike, "PE")
 
     if not (itm2_ce and itm2_pe):
         log_h2_error(f"History2 engine: {sym} — could not resolve ITM2 option "
@@ -212,7 +212,7 @@ async def _recheck_atm_shifts():
             continue
         prev_ctx = dict(state2.symbol_context.get(sym, {}))
         prev_itm_tokens = [prev_ctx.get(r) for r in ("itm2_ce", "itm2_pe")]
-        tokens = _resolve_and_register_strikes(sym, tracking, spot_ltp)
+        tokens = await _resolve_and_register_strikes(sym, tracking, spot_ltp)
         if not tokens:
             continue
         new_tokens.extend(tokens)

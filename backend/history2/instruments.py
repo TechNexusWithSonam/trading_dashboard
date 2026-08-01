@@ -1,8 +1,11 @@
 """Zerodha instrument-master resolution for History 2: underlying spot,
-CE/PE option tokens by strike/expiry. Isolated from the existing Upstox
-instrument mapping in backend/instruments.py and backend/instrument_keys.py —
-different broker, different token space, must not be conflated.
+CE/PE option tokens by strike/expiry. Shares the Zerodha instrument-dump
+cache (state2.instruments_cache) with backend/instruments.py (the main LOC
+engine) so both features download each exchange's dump once, not twice —
+the two modules' resolution logic stays independent, only the underlying
+cache/session is shared.
 """
+import asyncio
 import time
 
 from .logger import log_h2, log_h2_error
@@ -30,20 +33,40 @@ SPOT_ALIASES = {
 # come back without usable contracts and resolution will fail with a clear
 # "not found" rather than a wrong price.
 MCX_UNDERLYINGS = {"CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"}
+# SENSEX/BANKEX options trade on BSE's derivatives segment (BFO), not NFO —
+# using NFO for these two always returned "not found" (pre-existing gap;
+# fixed here since this module is being touched anyway for the asyncio fix).
+BFO_UNDERLYINGS = {"SENSEX", "BANKEX"}
 
 
 def _option_exchange(underlying: str) -> str:
-    return "MCX" if underlying.upper() in MCX_UNDERLYINGS else "NFO"
+    u = underlying.upper()
+    if u in MCX_UNDERLYINGS:
+        return "MCX"
+    if u in BFO_UNDERLYINGS:
+        return "BFO"
+    return "NFO"
 
 
-def _load(exchange: str) -> list[dict]:
+async def _load(exchange: str) -> list[dict]:
+    # NOTE: uses wall-clock time.time() (not loop.time()) because
+    # state2.instruments_loaded_at is a cache shared with
+    # backend/instruments.py's own _load_dump() — both must compare
+    # timestamps on the same clock or the TTL check is meaningless.
     now = time.time()
     loaded_at = state2.instruments_loaded_at.get(exchange, 0)
     if exchange in state2.instruments_cache and (now - loaded_at) < CACHE_TTL:
         return state2.instruments_cache[exchange]
     kite = get_kite()
     log_h2(f"Loading instrument master for {exchange}")
-    rows = kite.instruments(exchange)
+    # kiteconnect is synchronous (wraps `requests`) — a direct call here
+    # would block the whole asyncio event loop, including the live tick
+    # feed. This asyncio.to_thread offload is the fix for the exact issue
+    # that froze the Upstox feed when this was first called from engine.py's
+    # blocking initial-resolve pass (main.py's on_startup had disabled the
+    # autonomous engine for this reason — see the Upstox->Zerodha migration
+    # plan / [[async_blocking_calls_feedback]]).
+    rows = await asyncio.to_thread(kite.instruments, exchange)
     state2.instruments_cache[exchange] = rows
     state2.instruments_loaded_at[exchange] = now
     log_h2(f"Instrument master loaded for {exchange} ({len(rows)} rows)")
@@ -62,9 +85,9 @@ def _slim(row: dict) -> dict:
     }
 
 
-def _nearest_mcx_future(underlying: str) -> dict | None:
+async def _nearest_mcx_future(underlying: str) -> dict | None:
     try:
-        rows = _load("MCX")
+        rows = await _load("MCX")
     except Exception as e:
         log_h2_error(f"MCX instrument load failed for {underlying}: {e}")
         return None
@@ -75,14 +98,14 @@ def _nearest_mcx_future(underlying: str) -> dict | None:
     return futs[0]
 
 
-def search(query: str, limit: int = 20) -> list[dict]:
+async def search(query: str, limit: int = 20) -> list[dict]:
     q = query.strip().upper()
     if not q:
         return []
     out = []
     for exchange in ("NSE", "NFO", "BSE", "MCX"):
         try:
-            rows = _load(exchange)
+            rows = await _load(exchange)
         except Exception as e:
             log_h2_error(f"Instrument search failed for {exchange}: {e}")
             continue
@@ -94,14 +117,14 @@ def search(query: str, limit: int = 20) -> list[dict]:
     return out
 
 
-def resolve_spot(underlying: str) -> dict | None:
+async def resolve_spot(underlying: str) -> dict | None:
     underlying = underlying.upper()
 
     alias = SPOT_ALIASES.get(underlying)
     if alias:
         exchange, name = alias
         try:
-            rows = _load(exchange)
+            rows = await _load(exchange)
         except Exception as e:
             log_h2_error(f"Spot instrument resolution failed for {underlying}: {e}")
             return None
@@ -113,7 +136,7 @@ def resolve_spot(underlying: str) -> dict | None:
         return None
 
     if underlying in MCX_UNDERLYINGS:
-        fut = _nearest_mcx_future(underlying)
+        fut = await _nearest_mcx_future(underlying)
         if fut:
             log_h2(f"Spot instrument resolved (nearest MCX future, no cash spot exists for commodities): "
                    f"{underlying} -> token {fut['instrument_token']}")
@@ -124,7 +147,7 @@ def resolve_spot(underlying: str) -> dict | None:
 
     # F&O stock — its NSE equity tradingsymbol matches the derivatives underlying name exactly.
     try:
-        rows = _load("NSE")
+        rows = await _load("NSE")
     except Exception as e:
         log_h2_error(f"Spot instrument resolution failed for {underlying}: {e}")
         return None
@@ -136,13 +159,13 @@ def resolve_spot(underlying: str) -> dict | None:
     return None
 
 
-def resolve_option(underlying: str, expiry: str, strike: float, side: str) -> dict | None:
+async def resolve_option(underlying: str, expiry: str, strike: float, side: str) -> dict | None:
     """side: 'CE' or 'PE'. expiry: 'YYYY-MM-DD'."""
     underlying = underlying.upper()
     side = side.upper()
     exchange = _option_exchange(underlying)
     try:
-        rows = _load(exchange)
+        rows = await _load(exchange)
     except Exception as e:
         log_h2_error(f"{side} instrument resolution failed for {underlying}: {e}")
         return None
@@ -157,12 +180,12 @@ def resolve_option(underlying: str, expiry: str, strike: float, side: str) -> di
     return None
 
 
-def resolve_chain(underlying: str, expiry: str) -> list[dict]:
+async def resolve_chain(underlying: str, expiry: str) -> list[dict]:
     """All strikes for underlying/expiry with CE + PE tokens paired up."""
     underlying = underlying.upper()
     exchange = _option_exchange(underlying)
     try:
-        rows = _load(exchange)
+        rows = await _load(exchange)
     except Exception as e:
         log_h2_error(f"Option chain resolution failed for {underlying}: {e}")
         return []
@@ -179,11 +202,11 @@ def resolve_chain(underlying: str, expiry: str) -> list[dict]:
     return [by_strike[k] for k in sorted(by_strike)]
 
 
-def list_expiries(underlying: str) -> list[str]:
+async def list_expiries(underlying: str) -> list[str]:
     underlying = underlying.upper()
     exchange = _option_exchange(underlying)
     try:
-        rows = _load(exchange)
+        rows = await _load(exchange)
     except Exception as e:
         log_h2_error(f"Expiry list failed for {underlying}: {e}")
         return []

@@ -17,7 +17,7 @@ MCX option/spot month-pairing rule:
   May futures are still alive. This module:
     1. Resolves the futures key whose month matches the selected option
        expiry.
-    2. Subscribes that key on the upstream Upstox WS feed so live ticks
+    2. Subscribes that key on the shared Zerodha feed so live ticks
        flow into state.market_data automatically (idempotent).
     3. Reads spot LTP/OHLC from state.market_data; falls back to the
        chain's underlying_spot_price or a one-shot REST quote until WS
@@ -69,16 +69,16 @@ def resolve_spot_key(sym: str, expiry: str, default_spot_keys: dict) -> str:
     return _instr_mod._mcx_sym_to_key.get(target_sym, default_key)
 
 
-async def ensure_spot_subscribed(spot_key, upstox_ws, sub_binary,
+async def ensure_spot_subscribed(spot_key, feed_client, sub_binary,
                                   subscribed_set):
-    """Subscribe spot_key on the upstream WS feed if not already done.
+    """Subscribe spot_key on the shared feed if not already done.
     Idempotent — repeat calls for the same key are no-ops. Errors are
     swallowed so a transient WS hiccup doesn't 502 the calculator endpoint
     (REST fallback inside _resolve_spot_ohlc still works)."""
-    if not spot_key or not upstox_ws or spot_key in subscribed_set:
+    if not spot_key or not feed_client or spot_key in subscribed_set:
         return False
     try:
-        await sub_binary(upstox_ws, [spot_key], "full")
+        await sub_binary(feed_client, [spot_key], "full")
         subscribed_set.add(spot_key)
         print(f"[Calc] WS subscribed spot key {spot_key}")
         return True
@@ -93,7 +93,7 @@ async def _fetch_chain_cached(sym: str, expiry: str, access_token: str) -> dict:
     moved here so the calculator pipeline is self-contained.
 
     - 60 s cache: with the frontend polling every 5 s, only every ~12th
-      poll hits Upstox.
+      poll hits Zerodha.
     - Inflight dedup: concurrent callers wait on the same event.
     - 5-attempt backoff (~35 s window): rides out moderate 429 spells.
     """
@@ -142,12 +142,12 @@ async def _resolve_spot_ohlc(spot_key: str, market_data: dict,
     Preference order:
       1. state.market_data[spot_key] — populated by the live WS feed once
          ensure_spot_subscribed() has run and a tick has arrived.
-      2. chain_fallback_spot — Upstox returns underlying_spot_price on
-         the option/chain response for indices/stocks. Used only when no
-         WS tick is in yet (won't have OHLC; fills LTP only).
-      3. /v2/market-quote/quotes REST one-shot — last-resort lookup so
-         the very first calculator response after a fresh subscription
-         still carries spot data, before WS ticks land.
+      2. chain_fallback_spot — the option chain carries the underlying
+         spot price for indices/stocks. Used only when no WS tick is in
+         yet (won't have OHLC; fills LTP only).
+      3. kite.quote() REST one-shot — last-resort lookup so the very
+         first calculator response after a fresh subscription still
+         carries spot data, before WS ticks land.
     """
     md = market_data.get(spot_key) or {}
     ef = md.get("efeed", {}) or {}
@@ -192,7 +192,7 @@ async def _resolve_spot_ohlc(spot_key: str, market_data: dict,
 
 async def compute_calc_result(*, sym: str, expiry: str, default_spot_keys: dict,
                                market_data: dict, prev_close: dict,
-                               access_token: str, upstox_ws, sub_binary,
+                               access_token: str, feed_client, sub_binary,
                                subscribed_set: set):
     """End-to-end /api/calculator computation for the given (sym, expiry).
 
@@ -226,7 +226,7 @@ async def compute_calc_result(*, sym: str, expiry: str, default_spot_keys: dict,
     if not spot_key:
         spot_key = resolve_spot_key(sym, expiry, default_spot_keys)
 
-    await ensure_spot_subscribed(spot_key, upstox_ws, sub_binary, subscribed_set)
+    await ensure_spot_subscribed(spot_key, feed_client, sub_binary, subscribed_set)
 
     spot = await _resolve_spot_ohlc(spot_key, market_data, prev_close,
                                      access_token, chain_fallback_spot=chain_spot)

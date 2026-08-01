@@ -1,6 +1,8 @@
-"""In-memory state for History 2 — completely separate from the `state`
-object in main.py. Nothing here touches LOC/Upstox state, loc_history, or
-loc_engine."""
+"""In-memory session/instrument-cache state for the shared Zerodha client
+(access_token, instrument dumps) plus History-2-specific recording state.
+Separate from the `state` object in main.py (LOC/market-data state) — the
+LOC engine reads `state2.access_token` via zerodha_client.get_kite() but
+does not otherwise touch loc_history or loc_engine here."""
 
 
 class State2:

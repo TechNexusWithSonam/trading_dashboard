@@ -59,7 +59,7 @@ async def zerodha_callback(request_token: str = "", status: str = ""):
         log_h2_error("Zerodha callback missing request_token")
         return RedirectResponse(f"{FRONTEND_URL}/dashboard?history2_auth=failed")
     try:
-        zc.generate_session(request_token)
+        await zc.generate_session(request_token)
     except Exception as e:
         log_h2_error(f"Zerodha authentication failed: {e}")
         return RedirectResponse(f"{FRONTEND_URL}/dashboard?history2_auth=failed")
@@ -97,21 +97,21 @@ def _require_auth():
 @router.get("/instruments/search")
 async def instruments_search(q: str = Query(default="")):
     _require_auth()
-    return {"query": q, "results": instr.search(q)}
+    return {"query": q, "results": await instr.search(q)}
 
 
 @router.get("/instruments/expiries")
 async def instruments_expiries(underlying: str):
     _require_auth()
-    return {"underlying": underlying.upper(), "expiries": instr.list_expiries(underlying)}
+    return {"underlying": underlying.upper(), "expiries": await instr.list_expiries(underlying)}
 
 
 @router.get("/instruments/resolve")
 async def instruments_resolve(underlying: str, expiry: str, strike: float):
     _require_auth()
-    spot = instr.resolve_spot(underlying)
-    ce = instr.resolve_option(underlying, expiry, strike, "CE")
-    pe = instr.resolve_option(underlying, expiry, strike, "PE")
+    spot = await instr.resolve_spot(underlying)
+    ce = await instr.resolve_option(underlying, expiry, strike, "CE")
+    pe = await instr.resolve_option(underlying, expiry, strike, "PE")
     if not spot:
         raise HTTPException(404, f"Spot instrument not found for {underlying}")
     if not ce:
@@ -124,7 +124,7 @@ async def instruments_resolve(underlying: str, expiry: str, strike: float):
 @router.get("/options/chain")
 async def options_chain(underlying: str, expiry: str):
     _require_auth()
-    return {"underlying": underlying.upper(), "expiry": expiry, "chain": instr.resolve_chain(underlying, expiry)}
+    return {"underlying": underlying.upper(), "expiry": expiry, "chain": await instr.resolve_chain(underlying, expiry)}
 
 
 @router.get("/history/{symbol}")
