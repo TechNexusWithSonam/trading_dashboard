@@ -71,11 +71,15 @@ LOC_SYMBOLS = _INDEX_LOC + _MCX_LOC + [s for s in NSE_EQ_KEYS if s not in _INDEX
 LOC_SYMBOLS_SET = set(LOC_SYMBOLS)
 
 # ── Dynamic instrument keys ────────────────────────────────────────
-INDEX_KEYS = [
-    "NSE_INDEX|Nifty 50","NSE_INDEX|Nifty Bank","NSE_INDEX|Nifty Fin Service",
-    "NSE_INDEX|NIFTY MID SELECT","NSE_INDEX|Nifty Next 50",
-    "BSE_INDEX|SENSEX","BSE_INDEX|BANKEX",
-]
+# Upstox used human-readable literal strings as valid keys directly
+# ("NSE_INDEX|Nifty 50", no resolution needed). Zerodha's index keys are
+# "NSE_INDEX|<instrument_token>", resolved at runtime by
+# instruments._resolve_indices() (called from validate_mcx_keys()) — so
+# this can no longer be a static list computed once at import time; it must
+# read whatever's currently in _instruments_mod._index_keys, which is empty
+# until the first successful validate_mcx_keys() call after login.
+def _get_index_keys() -> list:
+    return list(_instruments_mod._index_keys.values())
 
 # Will be updated at startup after validate_mcx_keys()
 COMMODITY_KEYS = [mcx_key(s,0) for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER","COPPER"]]
@@ -447,7 +451,7 @@ async def startup_init():
         stock_comm_keys = list(dict.fromkeys(_ik.FO_STOCK_KEYS + COMMODITY_KEYS[:5]))
         data = await fetch_quotes_rest(stock_comm_keys, state.access_token)
         # Indices via /v2/market-quote/quotes
-        idx_data = await fetch_index_quotes(INDEX_KEYS, state.access_token)
+        idx_data = await fetch_index_quotes(_get_index_keys(), state.access_token)
         data.update(idx_data)
         for k, v in data.items():
             sym_name = _ik.ISIN_TO_SYMBOL.get(k, "")
@@ -478,13 +482,25 @@ async def startup_init():
             "market_status":state.market_status,
         })
 
-    # Step 8: Re-subscribe Upstox feed to validated commodity keys
+    # Step 8: Re-subscribe feed to validated commodity + index keys.
+    # Both COMMODITY_KEYS and _get_index_keys() are only resolved by
+    # validate_mcx_keys() (Step 1, above) — start_feed()'s own initial
+    # subscribe call can race ahead of that resolution and send an empty
+    # list, so this re-subscribe (now that resolution is guaranteed done)
+    # is the actual mechanism that gets them onto the live feed.
     if state.feed_client and COMMODITY_KEYS:
         try:
             await _sub_binary(state.feed_client, COMMODITY_KEYS, "full")
             print(f"[Init] Re-subscribed MCX keys: {COMMODITY_KEYS}")
         except Exception as e:
             print(f"[Init] MCX re-sub error: {e}")
+    idx_keys = _get_index_keys()
+    if state.feed_client and idx_keys:
+        try:
+            await _sub_binary(state.feed_client, idx_keys, "ltp")
+            print(f"[Init] Re-subscribed index keys: {idx_keys}")
+        except Exception as e:
+            print(f"[Init] Index re-sub error: {e}")
 
     # Step 7: Fetch CE/PE OHLC from REST (since chain may have 0s)
     if state.access_token:
@@ -756,7 +772,7 @@ async def _refresh_prev_close_cache():
     try:
         stock_comm_keys = list(dict.fromkeys(_ik.FO_STOCK_KEYS + COMMODITY_KEYS[:5]))
         data = await fetch_quotes_rest(stock_comm_keys, state.access_token)
-        idx_data = await fetch_index_quotes(INDEX_KEYS, state.access_token)
+        idx_data = await fetch_index_quotes(_get_index_keys(), state.access_token)
         data.update(idx_data)
         updated = 0
         for k, v in data.items():
@@ -1494,10 +1510,10 @@ async def _index_ohlc_poll():
     same update a WS tick would have produced."""
     while True:
         await asyncio.sleep(_INDEX_POLL_INTERVAL)
-        if not state.access_token or not INDEX_KEYS:
+        if not state.access_token or not _get_index_keys():
             continue
         try:
-            data = await fetch_index_quotes(INDEX_KEYS, state.access_token)
+            data = await fetch_index_quotes(_get_index_keys(), state.access_token)
         except Exception as e:
             print(f"[IndexPoll] error: {e}")
             continue
@@ -1529,7 +1545,7 @@ async def start_feed():
     print("[Feed] Zerodha ticker connected/shared")
 
     # 1. Indices — LTP mode only (see _index_ohlc_poll for why)
-    await _sub_binary(ticker2, INDEX_KEYS, "ltp")
+    await _sub_binary(ticker2, _get_index_keys(), "ltp")
     await asyncio.sleep(0.2)
 
     # 2. Commodities — full mode (both current & next month)
@@ -1562,7 +1578,7 @@ async def start_feed():
             if st_sym.itm1_pe.instrument_key:
                 itm1_option_key_map[st_sym.itm1_pe.instrument_key] = (st_sym.symbol,"PE")
 
-    print(f"[Feed] Subscribed: {len(INDEX_KEYS)} idx | "
+    print(f"[Feed] Subscribed: {len(_get_index_keys())} idx | "
           f"{len(COMMODITY_KEYS)} mcx | {len(stock_keys)} stocks | "
           f"{len(all_opt_keys)} options ({len(opt_keys)} ITM2 + {len(itm1_keys)} ITM1)")
 
