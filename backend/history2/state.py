@@ -1,8 +1,12 @@
 """In-memory session/instrument-cache state for the shared Zerodha client
-(access_token, instrument dumps) plus History-2-specific recording state.
-Separate from the `state` object in main.py (LOC/market-data state) — the
-LOC engine reads `state2.access_token` via zerodha_client.get_kite() but
-does not otherwise touch loc_history or loc_engine here."""
+(access_token, instrument dumps). Separate from the `state` object in
+main.py (LOC/market-data state) — the LOC engine reads `state2.access_token`
+via zerodha_client.get_kite() but does not otherwise touch it here.
+
+Was also home to History 2's recording-specific state (symbol_context,
+symbol_meta, broadcast_tokens, live_by_symbol, history, last_minute,
+live_ticks) — removed along with that feature; nothing in the codebase
+reads them anymore."""
 
 
 class State2:
@@ -13,32 +17,6 @@ class State2:
         # exchange -> list[dict] instrument rows, plus per-exchange load timestamp
         self.instruments_cache: dict[str, list[dict]] = {}
         self.instruments_loaded_at: dict[str, float] = {}
-        # instrument_token -> {"lastPrice":.., "timestamp":..} — latest tick per token
-        self.live_ticks: dict[int, dict] = {}
-
-        # symbol -> {role: token} — role is "spot"/"ce"/"pe" (manual frontend
-        # subscribe) or "itm1_ce"/"itm1_pe"/"itm2_ce"/"itm2_pe" (autonomous
-        # engine, see engine.py). Populated via a MERGE (setdefault+update),
-        # never a wholesale replace, so the manual per-page subscribe and the
-        # always-on background engine can both register roles for the same
-        # symbol without clobbering each other.
-        self.symbol_context: dict[str, dict] = {}
-        # symbol -> {"itm1_ce_strike":, "itm1_pe_strike":, "itm2_ce_strike":,
-        # "itm2_pe_strike":, "last_atm":, "expiry":} — set by engine.py,
-        # merged into recorded history rows by history.py.
-        self.symbol_meta: dict[str, dict] = {}
-        # instrument tokens explicitly subscribed by a connected frontend
-        # client via the WS "history2:subscribe" message — used to avoid
-        # broadcasting history2:tick for the much larger autonomous-engine
-        # watchlist (recording-only, nobody's watching those tokens live).
-        self.broadcast_tokens: set[int] = set()
-        # symbol -> {"spot_ltp":, "ce_ltp":, "pe_ltp":, "itm1_ce_ltp":, ...,
-        # "ts":} — latest known values, keyed by role_ltp
-        self.live_by_symbol: dict[str, dict] = {}
-        # symbol -> newest-first list of history rows, max 200
-        self.history: dict[str, list[dict]] = {}
-        # symbol -> minute bucket (int(ts_ms // 60000)) of the last recorded row
-        self.last_minute: dict[str, int] = {}
 
 
 state2 = State2()

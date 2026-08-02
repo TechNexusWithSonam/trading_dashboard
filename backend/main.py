@@ -30,12 +30,15 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
 
 # History 2 — shares this same Zerodha session/ticker with the LOC engine
 # below (see backend/history2/zerodha_client.py, ticker.py); does not touch
-# LOC state directly.
-from .history2.routes import router as _history2_router, zerodha_router as _history2_zerodha_router
+# LOC state directly. History 2 the product feature has been removed —
+# history2/routes.py now exports only zerodha_router, the shared OAuth
+# callback (/api/zerodha/callback, /api/zerodha/postback) registered with
+# Zerodha's app console. Do not remove this — it's the only working
+# callback URL and the whole app's login flow depends on it.
+from .history2.routes import zerodha_router as _history2_zerodha_router
 from .history2 import zerodha_client as zc
 from .history2.state import state2
 from .history2.ticker import ticker2
-app.include_router(_history2_router)
 app.include_router(_history2_zerodha_router)
 
 FRONTEND_DIST   = Path(__file__).parent.parent / "frontend" / "dist"
@@ -2012,22 +2015,6 @@ async def on_startup():
 
     # Start stale-option monitor (Bug 1 fallback: REST fetch when WS tick absent)
     asyncio.create_task(_supervise("stale_option_monitor", _stale_option_monitor))
-
-    # History 2 — autonomous background engine, independent of any frontend
-    # connection, running alongside this file's own start_feed()/
-    # periodic_refresh() autonomy on the SAME shared Zerodha session/ticker.
-    # Waits internally for Zerodha auth before doing anything; supervised so
-    # a crash restarts it instead of silently stopping recording.
-    #
-    # Re-enabled: this was disabled (2026-07-31) because its initial resolve
-    # pass made ~200 synchronous (blocking) Zerodha SDK/instrument-scan calls
-    # with no asyncio.to_thread offload, starving the event loop and
-    # stalling the live feed for many minutes on every restart. Fixed as
-    # part of the Upstox->Zerodha migration: history2/instruments.py's
-    # _load()/resolve_*() and engine.py's _resolve_and_register_strikes()
-    # are now async and offload every kite.* call via asyncio.to_thread.
-    from .history2 import engine as _history2_engine
-    asyncio.create_task(_supervise("history2_engine", _history2_engine.start))
 
     asyncio.create_task(_delayed_startup())
 
