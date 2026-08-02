@@ -48,6 +48,13 @@ class SymbolState:
     itm1_ce:OptionData=field(default_factory=OptionData)
     itm1_pe:OptionData=field(default_factory=OptionData)
     itm1_ce_strike:float=0; itm1_pe_strike:float=0
+    # 2nd OTM pair — additive, LTP-only (no OHLC tracked, per product decision).
+    # OTM-2 CE is the CE contract at pe_strike (ATM+2*step — OTM for calls);
+    # OTM-2 PE is the PE contract at ce_strike (ATM-2*step — OTM for puts).
+    # Same strikes already tracked above, just the opposite option side —
+    # no new strike math, just an opposite-side chain lookup.
+    otm2_ce_ltp:float=0; otm2_pe_ltp:float=0
+    otm2_ce_key:str=""; otm2_pe_key:str=""
     expiry:str=""
     option_chain:dict=field(default_factory=dict)
     loc_result:dict=field(default_factory=dict)
@@ -219,13 +226,20 @@ class LOCEngine:
                 any_strike_changed = True
                 prev_ce_key = st.ce.instrument_key
                 prev_pe_key = st.pe.instrument_key
+                prev_otm2_ce_key = st.otm2_ce_key
+                prev_otm2_pe_key = st.otm2_pe_key
                 st.ce_strike = ce_s
                 st.pe_strike = pe_s
                 print(f"[LOC] {symbol} ATM shift→{new_atm} CE:{ce_s} PE:{pe_s} (ITM1 CE:{itm1_ce_s} PE:{itm1_pe_s})")
                 # Load from cached chain so the new strike's instrument_key is set.
                 self._load_from_chain(symbol)
+                # OTM-2 uses the same ce_strike/pe_strike (opposite side) —
+                # additive, does not read or write anything _load_from_chain touches.
+                self._load_otm2_from_chain(symbol)
                 if (st.ce.instrument_key != prev_ce_key or
-                        st.pe.instrument_key != prev_pe_key):
+                        st.pe.instrument_key != prev_pe_key or
+                        st.otm2_ce_key != prev_otm2_ce_key or
+                        st.otm2_pe_key != prev_otm2_pe_key):
                     any_keys_changed = True
             if itm1_ce_s != st.itm1_ce_strike or itm1_pe_s != st.itm1_pe_strike:
                 any_strike_changed = True
@@ -385,6 +399,7 @@ class LOCEngine:
 
         self._load_from_chain(symbol)
         self._load_itm1_from_chain(symbol)
+        self._load_otm2_from_chain(symbol)
 
     def _load_strikes_from_chain(self, symbol:str, ce_strike:float, pe_strike:float,
                                   ce_opt:'OptionData', pe_opt:'OptionData', label:str='ITM2'):
@@ -550,6 +565,49 @@ class LOCEngine:
             symbol, st.itm1_ce_strike, st.itm1_pe_strike, st.itm1_ce, st.itm1_pe, label='ITM1')
         self._recalc(symbol)
 
+    def _load_otm2_from_chain(self, symbol:str):
+        """Load 2nd-OTM CE/PE LTP from the cached chain. OTM-2 CE = the CE
+        contract at pe_strike (ATM+2*step — OTM for calls); OTM-2 PE = the
+        PE contract at ce_strike (ATM-2*step — OTM for puts). Same strikes
+        ce_strike/pe_strike already track, just the opposite option side —
+        no new strike math. LTP-only (no OHLC) by product decision.
+
+        Deliberately NOT routed through _load_strikes_from_chain — that
+        function's nearest-strike-fallback and MCX-illiquid-jump logic
+        exists for the ITM-2/ITM-1 pairs the 25 LOC formulas actually
+        depend on. This stays a plain, isolated dict lookup so a bug here
+        can never touch ce/pe/itm1_ce/itm1_pe state."""
+        st = self.symbols.get(symbol)
+        if not st or not st.option_chain: return
+        ce_row = st.option_chain.get(st.pe_strike, {}).get("CE") or {}
+        pe_row = st.option_chain.get(st.ce_strike, {}).get("PE") or {}
+        if ce_row:
+            ltp = float(ce_row.get("ltp") or 0)
+            if ltp: st.otm2_ce_ltp = ltp
+            st.otm2_ce_key = ce_row.get("key", "") or st.otm2_ce_key
+        if pe_row:
+            ltp = float(pe_row.get("ltp") or 0)
+            if ltp: st.otm2_pe_ltp = ltp
+            st.otm2_pe_key = pe_row.get("key", "") or st.otm2_pe_key
+        self._recalc(symbol)
+
+    def update_otm2_option_from_feed(self, symbol:str, opt_type:str, ltp:float):
+        """Real-time LTP-only update for the OTM-2 pair from a WS tick.
+        Mirrors update_option_from_feed's shape but writes only otm2_ce_ltp/
+        otm2_pe_ltp — no high/low/close tracked for this pair."""
+        st = self.symbols.get(symbol)
+        if not st or not ltp or ltp <= 0: return
+        if opt_type == "CE": st.otm2_ce_ltp = ltp
+        else: st.otm2_pe_ltp = ltp
+        self._recalc(symbol)
+
+    def get_otm2_option_keys(self) -> list:
+        keys = []
+        for st in self.symbols.values():
+            if st.otm2_ce_key: keys.append(st.otm2_ce_key)
+            if st.otm2_pe_key: keys.append(st.otm2_pe_key)
+        return [k for k in keys if k]
+
     def _recalc(self, symbol:str):
         """Run all 25 LOC formulas and notify."""
         st = self.symbols.get(symbol)
@@ -602,6 +660,10 @@ class LOCEngine:
             "itm1_pe_low":    round(st.itm1_pe.effective_low, 2),
             "itm1_ce_iv":     round(st.itm1_ce.iv, 2),
             "itm1_pe_iv":     round(st.itm1_pe.iv, 2),
+            # 2nd OTM pair — additive, LTP-only reference fields (client request).
+            "otm2_ce_ltp":  round(st.otm2_ce_ltp, 2),
+            "otm2_pe_ltp":  round(st.otm2_pe_ltp, 2),
+            "otm2_diff":    round(st.otm2_ce_ltp - st.otm2_pe_ltp, 2),
             "ts":        int(time.time() * 1000),
         })
         st.loc_result = res

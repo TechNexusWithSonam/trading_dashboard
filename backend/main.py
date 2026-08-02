@@ -89,6 +89,7 @@ SPOT_KEYS_D: dict = {}   # filled at startup
 FEED_KEY_TO_SYM: dict = {}
 option_key_map:      dict = {}   # LOC option key (ITM-2) → (symbol, "CE"/"PE")
 itm1_option_key_map: dict = {}   # LOC option key (ITM-1) → (symbol, "CE"/"PE")
+otm2_option_key_map: dict = {}   # LOC option key (OTM-2, LTP-only reference) → (symbol, "CE"/"PE")
 calc_option_key_map: dict = {}   # Calculator option key → (symbol, "CE"/"PE")
 option_key_last_tick: dict = {}  # instrument_key → last WS tick timestamp (for stale detection)
 _OPTION_KEY_MAX_AGE = 3600  # prune entries older than 1 hour to prevent unbounded growth
@@ -221,7 +222,8 @@ def _record_loc_hist(sym, loc):
             "zone","change","direction","different",
             "call_cp_diff","put_cp_diff",
             "ce_strike","pe_strike","ce_ltp","pe_ltp","ce_iv","pe_iv",
-            "itm1_ce_strike","itm1_pe_strike","itm1_ce_ltp","itm1_pe_ltp","itm1_ce_iv","itm1_pe_iv"]
+            "itm1_ce_strike","itm1_pe_strike","itm1_ce_ltp","itm1_pe_ltp","itm1_ce_iv","itm1_pe_iv",
+            "otm2_ce_ltp","otm2_pe_ltp","otm2_diff"]
     hist.insert(0, {"ts":int(time.time()*1000), **{k:loc[k] for k in keep if k in loc}})
     if len(hist) > 200: hist.pop()
 
@@ -274,6 +276,26 @@ def _route_tick(key, ltp, cp, o, h, l, ts):
                 itm1_option_key_map.pop(key, None)
             else:
                 loc_engine.update_itm1_option_from_feed(sym_i, opt_type_i, ltp, cp, h, l)
+                option_key_last_tick[key] = time.time()
+    # ── LOC OTM-2 option routing (parallel, LTP-only reference data) ──
+    otm2_mapping = otm2_option_key_map.get(key)
+    if not otm2_mapping:
+        for st in loc_engine.symbols.values():
+            if st.otm2_ce_key == key:
+                otm2_mapping = (st.symbol, "CE"); break
+            if st.otm2_pe_key == key:
+                otm2_mapping = (st.symbol, "PE"); break
+        if otm2_mapping:
+            otm2_option_key_map[key] = otm2_mapping
+    if otm2_mapping:
+        sym_o, opt_type_o = otm2_mapping
+        st = loc_engine.get_state(sym_o)
+        if st:
+            cur_o = st.otm2_ce_key if opt_type_o == "CE" else st.otm2_pe_key
+            if key != cur_o:
+                otm2_option_key_map.pop(key, None)
+            else:
+                loc_engine.update_otm2_option_from_feed(sym_o, opt_type_o, ltp)
                 option_key_last_tick[key] = time.time()
     # ── Calculator option routing (parallel, decoupled from LOC) ───
     cmap = calc_option_key_map.get(key)
@@ -612,8 +634,9 @@ async def _subscribe_new_option_keys():
     if not state.feed_client: return
     loc_keys  = [k for k in loc_engine.get_option_keys() if k]
     itm1_keys = [k for k in loc_engine.get_itm1_option_keys() if k]
+    otm2_keys = [k for k in loc_engine.get_otm2_option_keys() if k]
     calc_keys = [k for k in loc_engine.get_calc_option_keys() if k]
-    all_keys  = list(dict.fromkeys(loc_keys + itm1_keys + calc_keys))
+    all_keys  = list(dict.fromkeys(loc_keys + itm1_keys + otm2_keys + calc_keys))
     all_keys_set = set(all_keys)
     new_keys  = [k for k in all_keys if k not in state.subscribed_option_keys]
     # get_option_keys()/get_calc_option_keys() only ever return each symbol's
@@ -642,7 +665,7 @@ async def _subscribe_new_option_keys():
             option_key_last_tick[key] = now
         # Log every key individually so subscription can be verified in logs
         for key in new_keys:
-            sym_info = option_key_map.get(key) or calc_option_key_map.get(key)
+            sym_info = option_key_map.get(key) or itm1_option_key_map.get(key) or otm2_option_key_map.get(key) or calc_option_key_map.get(key)
             label = f"{sym_info[0]}/{sym_info[1]}" if sym_info else "unknown"
             print(f"[Options] Subscribed key={key} → {label}")
         print(f"[Options] Total subscribed: {len(state.subscribed_option_keys)} option keys")
@@ -661,6 +684,10 @@ async def _subscribe_new_option_keys():
     for st in loc_engine.symbols.values():
         if st.itm1_ce.instrument_key: itm1_option_key_map[st.itm1_ce.instrument_key] = (st.symbol,"CE")
         if st.itm1_pe.instrument_key: itm1_option_key_map[st.itm1_pe.instrument_key] = (st.symbol,"PE")
+    otm2_option_key_map.clear()
+    for st in loc_engine.symbols.values():
+        if st.otm2_ce_key: otm2_option_key_map[st.otm2_ce_key] = (st.symbol,"CE")
+        if st.otm2_pe_key: otm2_option_key_map[st.otm2_pe_key] = (st.symbol,"PE")
     calc_option_key_map.clear()
     for sn, calc in loc_engine.calc_states.items():
         if calc.ce.instrument_key: calc_option_key_map[calc.ce.instrument_key] = (sn,"CE")
@@ -1558,10 +1585,11 @@ async def start_feed():
         await _sub_binary(ticker2, stock_keys[i:i+100], "full")
         await asyncio.sleep(0.2)
 
-    # 4. Option CE/PE keys from chain (ITM-2, plus additive ITM-1)
+    # 4. Option CE/PE keys from chain (ITM-2, plus additive ITM-1, OTM-2)
     opt_keys  = loc_engine.get_option_keys()
     itm1_keys = loc_engine.get_itm1_option_keys()
-    all_opt_keys = list(dict.fromkeys(opt_keys + itm1_keys))
+    otm2_keys = loc_engine.get_otm2_option_keys()
+    all_opt_keys = list(dict.fromkeys(opt_keys + itm1_keys + otm2_keys))
     if all_opt_keys:
         await _sub_binary(ticker2, all_opt_keys, "full")
         state.subscribed_option_keys.update(all_opt_keys)
@@ -1577,10 +1605,14 @@ async def start_feed():
                 itm1_option_key_map[st_sym.itm1_ce.instrument_key] = (st_sym.symbol,"CE")
             if st_sym.itm1_pe.instrument_key:
                 itm1_option_key_map[st_sym.itm1_pe.instrument_key] = (st_sym.symbol,"PE")
+            if st_sym.otm2_ce_key:
+                otm2_option_key_map[st_sym.otm2_ce_key] = (st_sym.symbol,"CE")
+            if st_sym.otm2_pe_key:
+                otm2_option_key_map[st_sym.otm2_pe_key] = (st_sym.symbol,"PE")
 
     print(f"[Feed] Subscribed: {len(_get_index_keys())} idx | "
           f"{len(COMMODITY_KEYS)} mcx | {len(stock_keys)} stocks | "
-          f"{len(all_opt_keys)} options ({len(opt_keys)} ITM2 + {len(itm1_keys)} ITM1)")
+          f"{len(all_opt_keys)} options ({len(opt_keys)} ITM2 + {len(itm1_keys)} ITM1 + {len(otm2_keys)} OTM2)")
 
     if not state._index_poll_task or state._index_poll_task.done():
         state._index_poll_task = asyncio.create_task(_index_ohlc_poll())
