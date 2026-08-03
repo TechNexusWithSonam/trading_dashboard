@@ -78,6 +78,12 @@ def main() -> int:
             _log(f"Password step rejected: {d1.get('message', d1)}")
             return 1
         request_id = d1["data"]["request_id"]
+        # Zerodha reports which 2FA method this account is actually configured
+        # for (e.g. "totp" vs its own app-based type) — must echo this back
+        # exactly in step 2, not guess a hardcoded value, or it's rejected
+        # with "The requested 2FA type is not available."
+        twofa_type = d1["data"].get("twofa_type", "totp")
+        _log(f"Password step OK, account 2FA type: {twofa_type}")
     except Exception as e:
         _log(f"Password step failed: {e}")
         return 1
@@ -88,7 +94,7 @@ def main() -> int:
         code = pyotp.TOTP(totp_secret).now()
         return session.post(KITE_TWOFA_URL, data={
             "user_id": user_id, "request_id": request_id,
-            "twofa_value": code, "twofa_type": "totp",
+            "twofa_value": code, "twofa_type": twofa_type,
         }, timeout=REQUEST_TIMEOUT)
 
     r2 = None
