@@ -22,6 +22,9 @@ ENV/
 # Zerodha session cache (History 2) - contains a live access token
 backend/history2/.zerodha_session.json
 
+# LOC history autosave cache - runtime data, not source
+backend/loc_history_cache.json
+
 # IDE
 .vscode/
 .idea/

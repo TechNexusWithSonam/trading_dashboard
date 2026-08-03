@@ -214,6 +214,9 @@ def _update_ohlc(key, ltp, ts_ms, o=0, h=0, l=0):
         hist.append({"t":minute,"o":o or ltp,"h":h or ltp,"l":l or ltp,"c":ltp,"v":1})
         if len(hist) > 400: hist.pop(0)
 
+# 4 hours of per-minute rows. (Was 200 = 3h20m.)
+LOC_HISTORY_MAX_ROWS = 240
+
 def _record_loc_hist(sym, loc):
     if not loc: return
     now = int(time.time()//60)*60000
@@ -228,7 +231,44 @@ def _record_loc_hist(sym, loc):
             "itm1_ce_strike","itm1_pe_strike","itm1_ce_ltp","itm1_pe_ltp","itm1_ce_iv","itm1_pe_iv",
             "otm2_ce_ltp","otm2_pe_ltp","otm2_diff"]
     hist.insert(0, {"ts":int(time.time()*1000), **{k:loc[k] for k in keep if k in loc}})
-    if len(hist) > 200: hist.pop()
+    if len(hist) > LOC_HISTORY_MAX_ROWS: hist.pop()
+
+# state.loc_history lives only in memory — a process restart (deploys,
+# crashes, manual `systemctl restart`) wipes the whole day's recorded rows,
+# which is exactly what produced the gaps a user reported (recording looked
+# like it "only worked while a page was open" — really it was restarts
+# resetting this dict, unrelated to any browser connection). Periodically
+# mirror it to disk and restore on startup so a restart loses at most
+# LOC_HISTORY_SAVE_INTERVAL_S seconds, not the whole day.
+LOC_HISTORY_CACHE_PATH = Path(__file__).parent / "loc_history_cache.json"
+LOC_HISTORY_SAVE_INTERVAL_S = 30
+
+async def _save_loc_history_cache():
+    try:
+        data = json.dumps(state.loc_history)
+        await asyncio.to_thread(LOC_HISTORY_CACHE_PATH.write_text, data)
+    except Exception as e:
+        print(f"[LOCHistory] save error: {e}")
+
+async def _loc_history_autosave():
+    while True:
+        await asyncio.sleep(LOC_HISTORY_SAVE_INTERVAL_S)
+        await _save_loc_history_cache()
+
+def _load_loc_history_cache():
+    if not LOC_HISTORY_CACHE_PATH.exists(): return
+    try:
+        state.loc_history = json.loads(LOC_HISTORY_CACHE_PATH.read_text())
+        # Reseed loc_hist_ts from each symbol's newest restored row so the
+        # once-per-minute-bucket guard above doesn't insert a duplicate row
+        # for whichever minute was already recorded right before restart.
+        for sym, hist in state.loc_history.items():
+            if hist:
+                state.loc_hist_ts[sym] = (hist[0].get("ts", 0) // 60000) * 60000
+        total = sum(len(h) for h in state.loc_history.values())
+        print(f"[LOCHistory] Restored {total} rows across {len(state.loc_history)} symbols from cache")
+    except Exception as e:
+        print(f"[LOCHistory] load error: {e}")
 
 def _route_tick(key, ltp, cp, o, h, l, ts):
     if not ltp: return
@@ -1992,6 +2032,7 @@ async def spa(path: str):
 @app.on_event("startup")
 async def on_startup():
     print(f"RAIMA Markets v9 | {'MOCK' if USE_MOCK else 'LIVE'} | broker=Zerodha")
+    _load_loc_history_cache()
     # Build initial key maps even without token
     global SPOT_KEYS_D, FEED_KEY_TO_SYM
     SPOT_KEYS_D = get_spot_keys()
@@ -2016,12 +2057,23 @@ async def on_startup():
     # Start stale-option monitor (Bug 1 fallback: REST fetch when WS tick absent)
     asyncio.create_task(_supervise("stale_option_monitor", _stale_option_monitor))
 
+    # Periodically mirror loc_history to disk so a restart loses only a few
+    # seconds of recording instead of the whole day (see _load_loc_history_cache).
+    asyncio.create_task(_supervise("loc_history_autosave", _loc_history_autosave))
+
     asyncio.create_task(_delayed_startup())
 
 async def _delayed_startup():
     await asyncio.sleep(3)
     await startup_init()
     state.chain_task = asyncio.create_task(_supervise("periodic_refresh", periodic_refresh))
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    # Best-effort final save so a clean `systemctl restart` (SIGTERM, not a
+    # crash) loses ~0 seconds of history instead of waiting for the next
+    # 30s autosave tick.
+    await _save_loc_history_cache()
 
 if __name__ == "__main__":
     import uvicorn
