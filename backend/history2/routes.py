@@ -14,12 +14,17 @@ route) — do not remove it.
 """
 import os
 
+import httpx
 from fastapi import APIRouter
 from fastapi.responses import RedirectResponse
 
 from . import zerodha_client as zc
 from .logger import log_h2, log_h2_error
 from .state import state2
+
+# Internal loopback call, not a public URL — used only to hand the freshly
+# generated token to the main LOC engine's own /auth/token route (see below).
+_INTERNAL_BASE_URL = os.getenv("INTERNAL_BASE_URL", "http://127.0.0.1:8000")
 
 # Kept outside any prefix — Kite Connect requires an exact match to the
 # configured redirect URL.
@@ -46,6 +51,24 @@ async def zerodha_callback(request_token: str = "", status: str = ""):
         log_h2_error(f"Zerodha authentication failed: {e}")
         return RedirectResponse(f"{FRONTEND_URL}/dashboard?auth=failed")
     log_h2(f"Zerodha authentication successful (user_id={state2.user_id})")
+
+    # This route only updates the shared Zerodha session (state2) — the main
+    # LOC engine in main.py keeps its own copy of the token (state.access_token,
+    # a plain attribute, not something that reads through to state2 live) and
+    # only refreshes/reconnects its feed when main.py's own /auth/token route
+    # runs. Since Zerodha's registered redirect_uri points HERE (not at
+    # main.py's /auth/callback), every login — manual or scripted — has to be
+    # explicitly forwarded to that route or the LOC engine silently keeps
+    # running on a stale token until the next full process restart.
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(f"{_INTERNAL_BASE_URL}/auth/token",
+                              json={"access_token": state2.access_token})
+            r.raise_for_status()
+        log_h2("Propagated fresh token to main LOC engine, feed restarting")
+    except Exception as e:
+        log_h2_error(f"Failed to propagate token to main LOC engine: {e}")
+
     return RedirectResponse(f"{FRONTEND_URL}/dashboard?auth=success")
 
 
