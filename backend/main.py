@@ -60,7 +60,7 @@ from .instruments import (
     normalize_mcx_response_key, normalize_response_key,
     refresh_nse_eq_keys, refresh_mcx_option_underlying,
     token_to_key, key_to_token,
-    STRIKE_STEPS, MONTHLY_SYMBOLS, _is_past_market_close_ist, _is_past_mcx_close_ist
+    STRIKE_STEPS, MONTHLY_SYMBOLS, _is_past_market_close_ist, _is_past_mcx_close_ist, _today_ist
 )
 from . import instruments as _instruments_mod
 from . import instrument_keys as _ik
@@ -108,23 +108,31 @@ _OPTION_KEY_MAX_AGE = 3600  # prune entries older than 1 hour to prevent unbound
 #  format to decode here).
 # ══════════════════════════════════════════════════════════════════
 async def _on_zerodha_tick(token: int, price: float, ts_ms: int):
-    key = _instruments_mod.token_to_key(token)
-    if not key:
-        return
-    full = ticker2.last_full_tick.get(token) or {}
-    ohlc = full.get("ohlc") or {}
-    cp = float(ohlc.get("close") or 0)
-    feed = {
-        "ltpc": {"ltp": price, "cp": cp},
-        "efeed": {
-            "ltp": price, "cp": cp,
-            "open": float(ohlc.get("open") or price),
-            "high": float(ohlc.get("high") or price),
-            "low":  float(ohlc.get("low") or price),
-            "oi":   float(full.get("oi") or 0),
-        },
-    }
-    await broadcast({"type": "live_feed", "feeds": {key: feed}, "currentTs": str(ts_ms)})
+    # This coroutine is scheduled per-tick via run_coroutine_threadsafe() from
+    # Ticker2's own thread (see history2/ticker.py) with its returned Future's
+    # result never awaited/retrieved — an uncaught exception here would be
+    # swallowed completely silently, with zero log trace, permanently
+    # stopping updates for just this one instrument. Guard defensively.
+    try:
+        key = _instruments_mod.token_to_key(token)
+        if not key:
+            return
+        full = ticker2.last_full_tick.get(token) or {}
+        ohlc = full.get("ohlc") or {}
+        cp = float(ohlc.get("close") or 0)
+        feed = {
+            "ltpc": {"ltp": price, "cp": cp},
+            "efeed": {
+                "ltp": price, "cp": cp,
+                "open": float(ohlc.get("open") or price),
+                "high": float(ohlc.get("high") or price),
+                "low":  float(ohlc.get("low") or price),
+                "oi":   float(full.get("oi") or 0),
+            },
+        }
+        await broadcast({"type": "live_feed", "feeds": {key: feed}, "currentTs": str(ts_ms)})
+    except Exception as e:
+        print(f"[Feed] _on_zerodha_tick error (token={token}): {e}")
 
 
 async def _on_zerodha_status(status: str):
@@ -1588,8 +1596,11 @@ async def _index_ohlc_poll():
             print(f"[IndexPoll] error: {e}")
             continue
         if data:
-            await broadcast({"type": "live_feed", "feeds": data,
-                              "currentTs": str(int(time.time() * 1000))})
+            try:
+                await broadcast({"type": "live_feed", "feeds": data,
+                                  "currentTs": str(int(time.time() * 1000))})
+            except Exception as e:
+                print(f"[IndexPoll] broadcast error: {e}")
 
 async def start_feed():
     if USE_MOCK:
@@ -1658,7 +1669,13 @@ async def start_feed():
           f"{len(all_opt_keys)} options ({len(opt_keys)} ITM2 + {len(itm1_keys)} ITM1 + {len(otm2_keys)} OTM2)")
 
     if not state._index_poll_task or state._index_poll_task.done():
-        state._index_poll_task = asyncio.create_task(_index_ohlc_poll())
+        # Supervised (unlike a bare create_task) so an uncaught exception
+        # restarts polling instead of permanently and silently stopping it —
+        # this task is the ONLY source of spot_high/spot_low for indices
+        # (their WS ticks are LTP-only), so a dead poll silently degrades
+        # CCD/PCD/Diff/Flip-Time to a frozen, degenerate value for every
+        # index symbol with zero visible error.
+        state._index_poll_task = asyncio.create_task(_supervise("index_ohlc_poll", _index_ohlc_poll))
 
     # ticker2 owns reconnect/watchdog from here — idle forever so a normal
     # return here isn't mistaken by _supervise() for a crash.
@@ -1911,15 +1928,19 @@ async def get_ohlc_hist(key: str, unit: str = "minutes", interval: int = 1,
         if len(remaining) >= 4: from_date = remaining[3]
 
     if not state.access_token: return {"key":key,"candles":[]}
-    from datetime import date, timedelta
+    from datetime import timedelta
 
+    # IST-based "today", not server-local date — the server runs in UTC and
+    # kite.historical_data() interprets naive dates as IST (see instruments.py's
+    # _today_ist()/_now_ist(), used consistently by fetch_intraday_candles/
+    # fetch_historical_candles below).
     if not to_date:
-        to_date = date.today().isoformat()
+        to_date = _today_ist().isoformat()
     if not from_date:
-        from_date = (date.today()-timedelta(days=5)).isoformat()
+        from_date = (_today_ist()-timedelta(days=5)).isoformat()
 
     # For today's intraday, use intraday endpoint
-    today = date.today().isoformat()
+    today = _today_ist().isoformat()
     if from_date == today and to_date == today and unit != "days":
         candles = await fetch_intraday_candles(key, state.access_token, unit, interval)
         return {"key":key,"candles":candles}

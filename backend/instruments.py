@@ -515,12 +515,26 @@ async def _historical(key: str, unit: str, interval: int, from_dt, to_dt) -> lis
     return result
 
 
+def _now_ist():
+    """Naive datetime holding the current IST wall-clock time — NOT the
+    server's local clock. The server runs in UTC (no TZ env var), but
+    kite.historical_data() takes naive datetimes and interprets them as IST,
+    so any naive datetime.now()/date.today() here would silently run 5h30m
+    behind real IST all day. Same fixed-offset approach already used by
+    _is_past_market_close_ist()/_is_past_mcx_close_ist() above."""
+    from datetime import datetime, timezone, timedelta as _td
+    return (datetime.now(timezone.utc) + _td(hours=5, minutes=30)).replace(tzinfo=None)
+
+
+def _today_ist():
+    return _now_ist().date()
+
+
 async def fetch_intraday_candles(key: str, token: str, unit: str = "minutes", interval: int = 1) -> list:
     """Fetch today's intraday candles."""
     if not token:
         return []
-    from datetime import datetime
-    now = datetime.now()
+    now = _now_ist()
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return await _historical(key, unit, interval, start, now)
 
@@ -534,7 +548,7 @@ async def fetch_historical_candles(key: str, token: str, unit: str, interval: in
     from datetime import datetime
     try:
         start = datetime.fromisoformat(from_date)
-        end = (datetime.now() if to_date == date.today().isoformat()
+        end = (_now_ist() if to_date == _today_ist().isoformat()
                else datetime.fromisoformat(to_date))
     except Exception:
         return []
