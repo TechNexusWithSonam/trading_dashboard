@@ -46,6 +46,29 @@ _MARKET_CLOSE = (15, 35)
 STALE_TICK_THRESHOLD_S = 150
 WATCHDOG_INTERVAL_S = 60
 
+# How long to wait after a connect attempt before judging it a success or a
+# failure — long enough to cover handshake + on_connect + resubscribe + at
+# least one real tick during market hours.
+RECONNECT_VERIFY_GRACE_S = 45
+# Consecutive *verified* (not just attempted) reconnect failures before
+# escalating past logging. At the watchdog's ~60-180s cadence this is
+# roughly 5-15 minutes of confirmed, unrecovered outage.
+RECONNECT_FAILURE_ESCALATION_THRESHOLD = 5
+# Minimum time between actual process-restart escalations (see
+# _escalate_if_needed) — prevents a restart loop if the underlying cause
+# persists across restarts.
+RESTART_COOLDOWN_S = 1800
+
+# How many past connect generations' bookkeeping (_reconnect_started_at,
+# _first_tick_at) to retain. Without this, a long-running process that
+# reconnects many times over days/weeks accumulates one dict entry per
+# reconnect forever. Safe to prune aggressively: _on_ticks only ever reads
+# the CURRENT generation's entry, and _verify_reconnect always checks
+# "generation == self._connect_generation" before it would need its own
+# generation's entry to still exist — a superseded generation's entry is
+# never read again by anything, by construction.
+MAX_TRACKED_GENERATIONS = 20
+
 
 def _within_market_hours(now: datetime | None = None) -> bool:
     now = now or datetime.now(IST)
@@ -74,23 +97,81 @@ class Ticker2:
         self.last_tick_at: float = 0
         self._watchdog_task: asyncio.Task | None = None
 
+        # Reconnect lifecycle bookkeeping (see start()/_connect()/
+        # _verify_reconnect()) — distinguishes "a reconnect was attempted"
+        # from "a reconnect actually recovered the feed". The Aug 2026
+        # outage showed this matters: 51 consecutive attempts each logged
+        # "connecting" and then silently never succeeded or failed
+        # observably, because nothing checked for a real tick afterward.
+        self._connect_generation: int = 0
+        self._reconnect_started_at: dict[int, float] = {}
+        self._first_tick_at: dict[int, float] = {}
+        self.consecutive_reconnect_failures: int = 0
+        self.last_reconnect_verified_at: float = 0
+        self._last_restart_escalation_at: float = 0
+
     def start(self, on_tick_async, on_status_async):
         """Register a tick/status listener and ensure the shared connection
         is running. Safe to call more than once from different owners — the
-        first call opens the socket; later calls just add their listener."""
+        first call opens the socket; later calls just add their listener.
+
+        Also the entry point the daily Zerodha token refresh flow calls
+        (main.py's /auth/token -> _restart() -> start_feed() -> this). A
+        prior bug here treated "self.kws is not None" as "already running"
+        and returned without ever opening a new socket — so a fresh token
+        never actually got used and a dead kws blocked reconnection
+        indefinitely. Now an existing-but-dead ticker is torn down and
+        replaced; a genuinely healthy one is left alone (no duplicate
+        connections)."""
         if on_tick_async not in self.tick_listeners:
             self.tick_listeners.append(on_tick_async)
         if on_status_async not in self.status_listeners:
             self.status_listeners.append(on_status_async)
+        if self.loop is None:
+            self.loop = asyncio.get_running_loop()
         if self.kws is not None:
-            return  # connection already running — listener is registered on it
+            if self.kws.is_connected():
+                log_h2("start(): existing Zerodha connection is healthy — reusing, no new socket opened")
+                return
+            log_h2_error("start(): existing ticker present but NOT connected — tearing down and "
+                         "reconnecting with the current access token")
+            self._teardown_kws()
         if not state2.access_token:
             raise RuntimeError("Not authenticated with Zerodha")
-        self.loop = asyncio.get_running_loop()
         self.last_tick_at = time.time()
         self._connect()
         if not self._watchdog_task:
             self._watchdog_task = self.loop.create_task(self._watchdog_loop())
+
+    def _teardown_kws(self):
+        """Safely close and clear the current kws reference. Shared by
+        start()'s stale-ticker branch and _force_reconnect() so the
+        close-error-handling isn't duplicated."""
+        if self.kws:
+            log_h2("Tearing down existing Zerodha ticker connection")
+            try:
+                self.kws.close()
+            except Exception as e:
+                log_h2_error(f"Error closing Zerodha ticker: {e}")
+        self.kws = None
+
+    def _prune_old_generations(self):
+        """Bound _reconnect_started_at / _first_tick_at to the last
+        MAX_TRACKED_GENERATIONS generations, called each time a new
+        generation is created. Never touches the current generation (the
+        cutoff is always strictly below it). Deliberately simple — no
+        locking needed: this runs on the main asyncio loop thread, same as
+        every other write to these dicts except _on_ticks's read/write of
+        _first_tick_at for the CURRENT generation only, which this can
+        never prune."""
+        # +1 so exactly MAX_TRACKED_GENERATIONS generations are retained
+        # (inclusive range [cutoff, current]), not MAX_TRACKED_GENERATIONS+1.
+        cutoff = self._connect_generation - MAX_TRACKED_GENERATIONS + 1
+        if cutoff <= 0:
+            return
+        for d in (self._reconnect_started_at, self._first_tick_at):
+            for g in [g for g in d if g < cutoff]:
+                del d[g]
 
     def _connect(self):
         self.kws = KiteTicker(API_KEY, state2.access_token, reconnect=True,
@@ -101,8 +182,96 @@ class Ticker2:
         self.kws.on_error = self._on_error
         self.kws.on_reconnect = self._on_reconnect
         self.kws.on_noreconnect = self._on_noreconnect
-        log_h2("Zerodha WebSocket connecting")
+        self._connect_generation += 1
+        gen = self._connect_generation
+        self._prune_old_generations()
+        self._reconnect_started_at[gen] = time.time()
+        log_h2(f"Zerodha WebSocket connecting (gen={gen})")
         self.kws.connect(threaded=True)
+        if self.loop and self.loop.is_running():
+            self.loop.create_task(self._verify_reconnect(gen, RECONNECT_VERIFY_GRACE_S))
+
+    async def _verify_reconnect(self, generation: int, grace_s: float):
+        """Runs grace_s after _connect() for `generation`. A reconnect is
+        only considered successful once a real tick has arrived under this
+        same generation (recorded by _on_ticks) — not merely because
+        connect() was called. This is what the Aug 2026 incident lacked:
+        51 reconnect attempts with no way to tell "attempted" from
+        "recovered", so nothing ever escalated."""
+        await asyncio.sleep(grace_s)
+        if generation != self._connect_generation:
+            return  # superseded by a newer reconnect attempt — nothing to verify
+        if generation in self._first_tick_at:
+            return  # _on_ticks already marked this generation successful
+        connected = bool(self.kws and self.kws.is_connected())
+        if connected and not _within_market_hours():
+            # Off-hours: a healthy-but-quiet socket (no trades to tick) is not a failure.
+            log_h2(f"Reconnect verification (gen={generation}): connected, no ticks "
+                   f"expected outside market hours — OK")
+            return
+        self.consecutive_reconnect_failures += 1
+        log_h2_error(
+            f"Reconnect verification FAILED (gen={generation}): connected={connected}, "
+            f"no tick received within {grace_s:.0f}s — "
+            f"consecutive_failures={self.consecutive_reconnect_failures}"
+        )
+        await self._escalate_if_needed()
+
+    async def _escalate_if_needed(self):
+        """Called after a verified reconnect failure. Always logs loudly once
+        the threshold is hit — today, nothing is ever logged when this whole
+        class of failure (repeated silent reconnect death) is happening.
+        Optionally exits the process so systemd (Restart=always) brings up a
+        fresh process/socket — gated behind ZERODHA_WS_AUTO_RESTART (default
+        off) and a cooldown so it can never loop-restart."""
+        if self.consecutive_reconnect_failures < RECONNECT_FAILURE_ESCALATION_THRESHOLD:
+            return
+        log_h2_error(
+            f"[CRITICAL] Zerodha WebSocket unrecoverable after "
+            f"{self.consecutive_reconnect_failures} consecutive failed reconnects — "
+            f"manual intervention likely required."
+        )
+        if os.getenv("ZERODHA_WS_AUTO_RESTART", "false").lower() not in ("1", "true", "yes"):
+            return
+        now = time.time()
+        if now - self._last_restart_escalation_at < RESTART_COOLDOWN_S:
+            log_h2_error(
+                "[CRITICAL] Auto-restart cooldown active — not restarting again yet "
+                f"(last restart escalation {int(now - self._last_restart_escalation_at)}s ago)"
+            )
+            return
+        self._last_restart_escalation_at = now
+        log_h2_error(
+            "[CRITICAL] ZERODHA_WS_AUTO_RESTART enabled — exiting process so "
+            "systemd (Restart=always) brings up a fresh process/socket."
+        )
+        os._exit(1)
+
+    def health(self) -> dict:
+        """Snapshot of ACTUAL feed health for /api/status — replaces the old
+        proxy ("a ticker object exists") with the ticker's own connected
+        state, tick recency, and reconnect-failure bookkeeping."""
+        now = time.time()
+        connected = bool(self.kws and self.kws.is_connected())
+        last_tick_age = (now - self.last_tick_at) if self.last_tick_at else None
+        if self.kws is None:
+            state = "disconnected"
+        elif not connected:
+            state = ("recovery_failed"
+                      if self.consecutive_reconnect_failures >= RECONNECT_FAILURE_ESCALATION_THRESHOLD
+                      else "reconnecting")
+        elif last_tick_age is not None and last_tick_age > STALE_TICK_THRESHOLD_S and _within_market_hours():
+            state = "connected_stale"
+        else:
+            state = "connected"
+        return {
+            "state": state,
+            "connected": connected,
+            "last_tick_age_s": round(last_tick_age, 1) if last_tick_age is not None else None,
+            "subscribed_tokens": len(self.subscribed_tokens),
+            "consecutive_reconnect_failures": self.consecutive_reconnect_failures,
+            "last_reconnect_verified_at": self.last_reconnect_verified_at or None,
+        }
 
     def stop(self):
         if self._watchdog_task:
@@ -166,12 +335,7 @@ class Ticker2:
 
     def _force_reconnect(self):
         log_h2_error(f"Forcing Zerodha ticker reconnect (last tick {int(time.time() - self.last_tick_at)}s ago)")
-        try:
-            if self.kws:
-                self.kws.close()
-        except Exception as e:
-            log_h2_error(f"Error closing stale ticker before reconnect: {e}")
-        self.kws = None
+        self._teardown_kws()
         self.last_tick_at = time.time()  # avoid the watchdog re-firing mid-reconnect
         self._connect()  # subscribed_tokens is untouched — on_connect resubscribes them all
 
@@ -203,6 +367,15 @@ class Ticker2:
     def _on_ticks(self, ws, ticks):
         try:
             self.last_tick_at = time.time()
+            gen = self._connect_generation
+            if gen not in self._first_tick_at:
+                # First real tick under this connect generation — unambiguous
+                # proof the reconnect actually recovered the feed (not just
+                # that connect() was called). See _verify_reconnect().
+                self._first_tick_at[gen] = self.last_tick_at
+                log_h2(f"First tick received after connect (gen={gen}) — feed live")
+                self.consecutive_reconnect_failures = 0
+                self.last_reconnect_verified_at = self.last_tick_at
             ts_ms = int(time.time() * 1000)
             for t in ticks:
                 token = t.get("instrument_token")
@@ -225,7 +398,7 @@ class Ticker2:
 
     def _on_connect(self, ws, response):
         try:
-            log_h2("Zerodha WebSocket connected")
+            log_h2(f"Zerodha WebSocket connected (gen={self._connect_generation})")
             self.last_tick_at = time.time()
             if self.subscribed_tokens:
                 tokens = list(self.subscribed_tokens)

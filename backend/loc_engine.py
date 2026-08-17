@@ -629,6 +629,12 @@ class LOCEngine:
         )
         res.update({
             "symbol":     symbol,
+            # spot_ts is the REAL last spot-tick time (WS or REST-fallback
+            # write into st.spot.ts) — distinct from "ts" below, which is
+            # merely this recalc's wall-clock time and gets re-stamped by
+            # unrelated CE/PE ticks even while spot itself is frozen. Do not
+            # treat "ts" as proof of spot freshness.
+            "spot_ts":    st.spot.ts,
             "spot_ltp":   round(spot_ltp, 2),
             "spot_close": round(st.spot.close or spot_ltp, 2),
             "spot_high":  round(st.spot.high  or spot_ltp, 2),

@@ -843,6 +843,85 @@ async def _stale_option_monitor():
                 await asyncio.sleep(0.2)
 
 
+SPOT_STALE_SEC = 30  # matches the option fallback's STALE_SEC for consistency
+
+async def _stale_fetch_spot(symbols: list):
+    """REST-refresh Spot LTP for symbols whose real spot tick (st.spot.ts —
+    NOT the LOC recompute ts) has gone stale, via one batched fetch_quotes_rest
+    call. Writes through the exact same loc_engine.update_spot() a WS tick
+    would use, so no calculation formula is touched — spot just gets its
+    value from a different source when the WS feed can't deliver one.
+    Mirrors _stale_fetch_option_ltp's REST-fallback shape for options."""
+    if not state.access_token or not symbols:
+        return
+    keys = [SPOT_KEYS_D[s] for s in symbols if SPOT_KEYS_D.get(s)]
+    if not keys:
+        return
+    try:
+        data = await fetch_quotes_rest(keys, state.access_token)
+    except Exception as e:
+        print(f"[SpotStale] REST fetch error: {e}")
+        return
+    if not data:
+        return
+    now_ms = int(time.time() * 1000)
+    updated = []
+    for sym in symbols:
+        key = SPOT_KEYS_D.get(sym)
+        row = data.get(key) if key else None
+        if not row:
+            continue
+        ltp = row.get("ltpc", {}).get("ltp", 0)
+        if not ltp:
+            continue
+        st = loc_engine.get_state(sym)
+        if not st:
+            continue
+        # Don't blindly overwrite a fresher WS value that may have landed
+        # while this REST call was in flight — only apply if spot is still
+        # actually stale right now.
+        if st.spot.ts and (now_ms - st.spot.ts) < SPOT_STALE_SEC * 1000:
+            continue
+        ef = row.get("efeed", {})
+        loc_engine.update_spot(
+            sym, ltp, ef.get("cp") or 0, ef.get("high") or 0, ef.get("low") or 0,
+            now_ms, ef.get("open") or 0)
+        state.market_data[key] = {**state.market_data.get(key, {}), **row,
+                                   "ts": str(now_ms), "display_name": sym}
+        updated.append(sym)
+    if updated:
+        print(f"[SpotStale] REST injected fresh spot for {len(updated)} symbols: {updated}")
+
+
+async def _stale_spot_monitor():
+    """Background task: every SPOT_STALE_SEC, check each LOC symbol's real
+    spot-tick timestamp (st.spot.ts) and REST-refresh whichever have gone
+    stale — so Spot/Equity/Commodity LTP never freezes silently the way it
+    did during the Aug 2026 WS outage (root cause: WS died, but nothing
+    fell back to REST for spot the way options already do). Indices are
+    excluded — they already have their own independent REST poll
+    (_index_ohlc_poll) and must stay untouched."""
+    await asyncio.sleep(60)
+    while True:
+        await asyncio.sleep(SPOT_STALE_SEC)
+        if not state.access_token:
+            continue
+        try:
+            now_ms = int(time.time() * 1000)
+            stale_syms = []
+            for sym, st in loc_engine.symbols.items():
+                if sym in _INDEX_LOC or sym not in SPOT_KEYS_D:
+                    continue
+                if not st.spot.ts or (now_ms - st.spot.ts) > SPOT_STALE_SEC * 1000:
+                    stale_syms.append(sym)
+            if stale_syms:
+                print(f"[SpotStale] {len(stale_syms)} symbols with no fresh spot tick "
+                      f"in {SPOT_STALE_SEC}s — REST fallback: {stale_syms}")
+                await _stale_fetch_spot(stale_syms)
+        except Exception as e:
+            print(f"[SpotStale] monitor error: {e}")
+
+
 async def _refresh_prev_close_cache():
     """Re-derive state.prev_close from REST so MCX fallback doesn't go stale
     across trading days. net_change is authoritative (ltp - net_change = prev close)."""
@@ -1770,9 +1849,21 @@ async def ping():
 
 @app.get("/api/status")
 async def api_status():
+    # feed_health: actual socket/tick health (see Ticker2.health()) — replaces
+    # the old "a ticker object exists" proxy that stayed true for hours after
+    # the Aug 2026 outage killed the real connection. feed_connected keeps its
+    # existing name/type (bool) for backward compatibility but now reflects
+    # real connection state instead of "was start() ever called".
+    if USE_MOCK:
+        feed_health = {"state": "mock", "connected": True, "last_tick_age_s": 0,
+                        "subscribed_tokens": None, "consecutive_reconnect_failures": 0,
+                        "last_reconnect_verified_at": None}
+    else:
+        feed_health = ticker2.health()
     return {
         "auth": bool(state.access_token) or USE_MOCK,
-        "feed_connected": state.feed_client is not None,
+        "feed_connected": feed_health["connected"],
+        "feed_health": feed_health,
         "instruments": len(state.market_data), "frames": state.frame_count,
         "decoded": state.decode_ok, "mode": "mock" if USE_MOCK else "live",
         "option_keys": len(state.subscribed_option_keys),
@@ -2077,6 +2168,10 @@ async def on_startup():
 
     # Start stale-option monitor (Bug 1 fallback: REST fetch when WS tick absent)
     asyncio.create_task(_supervise("stale_option_monitor", _stale_option_monitor))
+
+    # Start stale-spot monitor (REST fallback for Spot/Equity/Commodity LTP —
+    # the Aug 2026 outage had no equivalent of the option fallback above)
+    asyncio.create_task(_supervise("stale_spot_monitor", _stale_spot_monitor))
 
     # Periodically mirror loc_history to disk so a restart loses only a few
     # seconds of recording instead of the whole day (see _load_loc_history_cache).
