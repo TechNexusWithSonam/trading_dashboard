@@ -409,6 +409,17 @@ async def startup_init():
     # Step 3: Resolve NSE_EQ keys from the Zerodha instrument dump
     await refresh_nse_eq_keys()
 
+    # Step 2 ran before this resolution completed, so its "Add FNO stock
+    # keys to SPOT_KEYS_D" loop captured the still-unresolved ("") values —
+    # SPOT_KEYS_D's stock entries would otherwise stay empty strings for the
+    # rest of the process's life. This was harmless while nothing needed a
+    # real key out of SPOT_KEYS_D for stocks (WS routing uses FEED_KEY_TO_SYM,
+    # rebuilt below with resolved keys already) — but the stale-spot REST
+    # fallback (_stale_fetch_spot) does need one, and would otherwise
+    # silently filter out every stock. Re-apply now that resolution is done.
+    for sym, key in _ik.NSE_EQ_KEYS.items():
+        SPOT_KEYS_D[sym] = key
+
     # Step 4: Build reverse map — only PRIMARY (current month) MCX key per symbol
     FEED_KEY_TO_SYM.clear()
     for sym, key in SPOT_KEYS_D.items():
@@ -1713,6 +1724,18 @@ async def start_feed():
     await asyncio.sleep(0.2)
 
     # 3. F&O stocks — full mode for OHLC
+    # _ik.FO_STOCK_KEYS is populated by refresh_nse_eq_keys(), which runs
+    # inside startup_init() as a separate, concurrently-scheduled task
+    # (on_startup() fires this start_feed() task and _delayed_startup()'s
+    # startup_init() at the same time, with only a 3s head start for this
+    # one). If that resolution hasn't finished yet, FO_STOCK_KEYS is still
+    # empty here and every stock would silently get ZERO WS subscriptions
+    # for the rest of the process's life — no error, just permanently
+    # stale Spot LTP for every stock. Resolve it directly if still empty
+    # rather than trusting the race to land in our favor.
+    if not _ik.FO_STOCK_KEYS:
+        print("[Feed] FO_STOCK_KEYS not yet resolved — resolving before stock subscription")
+        await refresh_nse_eq_keys()
     stock_keys = list(dict.fromkeys(_ik.FO_STOCK_KEYS))
     for i in range(0, len(stock_keys), 100):
         await _sub_binary(ticker2, stock_keys[i:i+100], "full")
