@@ -163,6 +163,7 @@ class AppState:
     ohlc:          dict = {}   # key → [{t,o,h,l,c,v}]
     loc_history:   dict = {}
     loc_hist_ts:   dict = {}
+    cp_flip_events: dict = {}  # symbol → latest cp_flip event dict, backend-authoritative (see loc_engine._recalc)
     sessions:      dict = {}
     expiry_cache:  dict = {}
     prev_close:    dict = {}
@@ -206,6 +207,17 @@ async def _on_loc(symbol: str, result: dict):
     state._loc_dirty.add(symbol)
 
 loc_engine.on_loc_update = _on_loc
+
+async def _on_cp_flip(symbol: str, event: dict):
+    # Backend is now the sole detector of CP Flip (see loc_engine._recalc).
+    # Stored so a client that (re)connects mid-day gets today's already-
+    # detected flip immediately via the initial "snapshot" message, and
+    # broadcast right away — cp_flip is not a "live_feed" message so it
+    # bypasses the 300ms _feed_buffer throttle in broadcast()/_send_to_clients.
+    state.cp_flip_events[symbol] = event
+    await broadcast(event)
+
+loc_engine.on_cp_flip = _on_cp_flip
 for sym in LOC_SYMBOLS:
     loc_engine.register(sym)
 
@@ -1476,6 +1488,7 @@ async def ws_browser(ws: WebSocket):
             "spot_keys": SPOT_KEYS_D,
             "commodity_keys": COMMODITY_KEYS,
             "mode": "mock" if USE_MOCK else "live",
+            "cp_flips": state.cp_flip_events,
         }))
     except Exception as e:
         print(f"[WS] Initial snapshot send failed: {e}")

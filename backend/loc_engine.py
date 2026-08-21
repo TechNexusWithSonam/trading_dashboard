@@ -44,6 +44,12 @@ class SymbolState:
     ce:OptionData=field(default_factory=OptionData)
     pe:OptionData=field(default_factory=OptionData)
     ce_strike:float=0; pe_strike:float=0
+    # Edge-trigger latch for CP-Flip detection (backend-authoritative — see
+    # LOCEngine._recalc). True while the existing flip condition
+    # (|call_cp_diff|>0.0020 AND |put_cp_diff|>0.0020 AND equal magnitude)
+    # holds; a flip event fires only on the false→true transition so a
+    # condition that stays true across many ticks emits exactly one event.
+    cp_flip_active:bool=False
     # 1st ITM strikes/data — additive alongside the ce/pe (2nd ITM) pair above.
     itm1_ce:OptionData=field(default_factory=OptionData)
     itm1_pe:OptionData=field(default_factory=OptionData)
@@ -158,6 +164,7 @@ class LOCEngine:
         self.calc_states:Dict[str,CalcState]={}               # Calculator-only views
         self.access_token:str=""
         self.on_loc_update:Optional[Callable]=None
+        self.on_cp_flip:Optional[Callable]=None      # (symbol, flip_event) → notify on new CP flip
         self.on_option_ohlc_needed:Optional[Callable]=None   # (symbol) → fetch OHLC REST
         self.on_option_keys_changed:Optional[Callable]=None  # () → subscribe new WS keys
         self.on_calc_keys_changed:Optional[Callable]=None    # () → subscribe calc keys
@@ -673,6 +680,35 @@ class LOCEngine:
             "ts":        int(time.time() * 1000),
         })
         st.loc_result = res
+
+        # ── CP-Flip detection (backend-authoritative) ──────────────────────
+        # Runs on EVERY recalc (every tick), before the 300ms broadcast
+        # throttle — this is the fix for flips that occur transiently between
+        # two throttled frontend broadcasts and would otherwise never be
+        # observed. Condition is unchanged from the prior frontend logic in
+        # useStore.js's _applyFlips: both diffs must clear 0.0020 in
+        # magnitude and be equal to each other within 1e-9. call_cp_diff/
+        # put_cp_diff here are already the same r4()-rounded values the
+        # frontend used to receive, so the comparison is bit-for-bit
+        # equivalent to the old frontend check.
+        c = abs(res["call_cp_diff"]); p = abs(res["put_cp_diff"])
+        flip_ok = c > 0.0020 and p > 0.0020 and abs(c - p) < 1e-9
+        if flip_ok and not st.cp_flip_active:
+            dir_ = (1 if res["call_cp_diff"] > res["put_cp_diff"] else
+                    -1 if res["call_cp_diff"] < res["put_cp_diff"] else 0)
+            flip_event = {
+                "type":     "cp_flip",
+                "symbol":   symbol,
+                "ts":       res["ts"],
+                "distance": res["different"],
+                "cltp":     res["ltp"],
+                "dir":      dir_,
+            }
+            if self.on_cp_flip:
+                ft = asyncio.create_task(self.on_cp_flip(symbol, flip_event))
+                ft.add_done_callback(lambda f: f.exception() if not f.cancelled() and f.exception() else None)
+        st.cp_flip_active = flip_ok
+
         if self.on_loc_update:
             t = asyncio.create_task(self.on_loc_update(symbol, res))
             t.add_done_callback(lambda f: f.exception() if not f.cancelled() and f.exception() else None)
